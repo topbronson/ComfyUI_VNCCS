@@ -870,6 +870,14 @@ def _generation_file_signatures(settings):
             "loras": tuple(control_center._model_file_signature(path or "") for path in paths)}
 
 
+def _style_keyed_preview_path(cache_dir, style_label):
+    """Timestamped, style-labeled preview variant kept beside the canonical preview.png
+    so each test attempt has a unique file (no cross-attempt thumbnail collapse)."""
+    safe = re.sub(r'[^A-Za-z0-9_\-]+', '_', str(style_label or "style").strip().lower()).strip('_')[:48] or "style"
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    return safe_join_under(cache_dir, f"preview_style_{safe}_{ts}.png")
+
+
 def _preview_cache_key(info, gen_settings):
     settings = normalize_gen_settings(gen_settings)
     settings["seed"] = gen_settings.get("seed", settings["seed"])
@@ -2596,6 +2604,7 @@ class CharacterCreatorV2:
         cache_dir = safe_join_under(character_dir(character_name), "cache")
         os.makedirs(cache_dir, exist_ok=True)
         cache_path = safe_join_under(cache_dir, "preview.png")
+        preview_variant_path = None
         cache_key = _preview_cache_key(info, gen_settings)
         cache_metadata = PngImagePlugin.PngInfo()
         cache_metadata.add_text("vnccs_preview_key", cache_key)
@@ -2788,6 +2797,13 @@ class CharacterCreatorV2:
                 c_img = tensor2pil(image)
                 with atomic_output_path(cache_path) as temporary:
                     c_img.save(temporary, format="PNG", pnginfo=cache_metadata)
+                try:
+                    preview_variant_path = _style_keyed_preview_path(cache_dir, info.get("style_label") or info.get("style"))
+                    with atomic_output_path(preview_variant_path) as temporary:
+                        c_img.save(temporary, format="PNG", pnginfo=cache_metadata)
+                except Exception as e:
+                    preview_variant_path = None
+                    log_event('warning', component='Creator', level='warning', message=f'Failed to write style-keyed preview variant: {e}', error=str(e))
                 log_event("preview_saved", component="Creator", character=character_name)
                 try:
                     # Notify Frontend
@@ -2815,9 +2831,11 @@ class CharacterCreatorV2:
             pil_img = pil_img.resize((512, 1536), Image.LANCZOS)
             image = pil2tensor(pil_img)
 
-        # Register the character preview with the job queue / history / asset
-        # database via the existing cache file (no duplicate copies).
-        _ui_images = output_relative_images([cache_path])
+        # Register the character preview with the job queue / history via a
+        # style-keyed unique file when this run regenerated one (each attempt
+        # keeps its own thumbnail), falling back to the canonical cache file.
+        _register_path = preview_variant_path if (preview_variant_path and os.path.isfile(preview_variant_path)) else cache_path
+        _ui_images = output_relative_images([_register_path])
         if _ui_images:
             return {"result": (image, sheets_path, background_color),
                     "ui": {"images": _ui_images}}
