@@ -743,6 +743,149 @@ def postprocess_character_wizard_result(parsed, user_description):
     return result
 
 
+WIZARD_BACKEND_CONFIG_PATH = os.path.join(
+    folder_paths.get_user_directory(), "default", "vnccs_character_wizard.json"
+)
+
+
+def _load_wizard_backend_config():
+    """Optional remote backend for the Character Wizard (same pattern as the
+    QI2 rewrite offload). Config is re-read per request; no restart needed.
+    Example user/default/vnccs_character_wizard.json:
+      {"enabled": true,
+       "chat_url": "http://host:8888/v1/chat/completions",
+       "model": "Qwen3.8-Flash-Next",
+       "api_key": "", "api_key_env": "QWEN38_API_KEY",
+       "timeout": 120, "native_fallback": true}
+    """
+    try:
+        with open(WIZARD_BACKEND_CONFIG_PATH, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        return cfg if isinstance(cfg, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        import logging
+        logging.warning("[VNCCS] invalid character wizard backend config: %s", e)
+        return {}
+
+
+def _wizard_via_remote(system_prompt, user_prompt, backend):
+    import urllib.error
+    import urllib.request
+
+    chat_url = str(backend.get("chat_url", "")).strip()
+    model = str(backend.get("model", "")).strip()
+    if not chat_url or not model:
+        raise ValueError("wizard backend config requires chat_url and model")
+    api_key = str(backend.get("api_key", "")).strip()
+    if not api_key:
+        api_key = os.environ.get(str(backend.get("api_key_env", "")).strip(), "").strip()
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "max_tokens": int(backend.get("max_tokens", 900)),
+        "temperature": float(backend.get("temperature", 0.3)),
+    }
+    timeout = float(backend.get("timeout", 120))
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    # Thinking models emit their whole budget as reasoning unless the template
+    # toggle is off; drop the kwarg and retry once if the endpoint rejects it.
+    for attempt_with_kwargs in (True, False):
+        body = dict(payload)
+        if attempt_with_kwargs:
+            body["chat_template_kwargs"] = backend.get(
+                "chat_template_kwargs", {"enable_thinking": False}
+            )
+        req = urllib.request.Request(
+            chat_url,
+            data=json.dumps(body).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8", "replace")[:400]
+            except Exception:
+                pass
+            if attempt_with_kwargs and e.code == 400 and "chat_template_kwargs" in detail:
+                continue
+            raise RuntimeError(f"wizard backend HTTP {e.code}: {detail}")
+        choices = data.get("choices") or []
+        if not choices:
+            raise RuntimeError(f"wizard backend returned no choices: {json.dumps(data)[:300]}")
+        return choices[0].get("message", {}).get("content", ""), model
+    raise RuntimeError("wizard backend: no request attempt made")
+
+
+def _build_character_wizard_prompts(user_description, tag_options):
+    system_prompt = (
+        "You are a professional anime/game character designer. "
+        "Convert broad character ideas into concise structured character fields. "
+        "Output valid JSON only."
+    )
+    user_prompt = f"""
+Create a character from this abstract idea:
+{user_description}
+
+Use these curated presets when they fit. Free-form descriptions are also supported; keep breast/chest size tags exactly as listed:
+{json.dumps(tag_options, ensure_ascii=False)}
+
+Use one of these skin_color values only when the user's idea explicitly mentions skin tone or complexion:
+{json.dumps(SKIN_COLOR_OPTIONS, ensure_ascii=False)}
+
+Return a raw JSON object with exactly these keys:
+- sex: "male" or "female"
+- age: integer from 1 to 100
+- race
+- skin_color
+- body
+- face
+- hair
+- eyes
+- additional_details
+
+Rules:
+- Use comma-separated prompt fragments for text fields.
+- The race field is for species/fantasy traits only. For normal humans set race to "human".
+- Never put ethnicity, nationality, profession, role, clothing, or archetype in race. Examples of invalid race values: "afro_student", "black student", "asian girl", "teacher".
+- Put skin tone in skin_color, not race. "afro", "African", "African-American", "black", or similar means skin_color should be "dark skin" unless another skin tone is explicit.
+- For body, always provide a visible body/build descriptor. Use listed breast/chest tags when relevant, and add concise build phrases like "slim build", "average build", "athletic build" when useful.
+- For race, use a listed species name when it fits; its visual features are added automatically.
+- For other fields, prefer concise natural-language descriptions from the presets when they fit.
+- For skin_color, do not guess a default. Use an empty string unless the user's idea explicitly mentions skin tone, complexion, or non-human skin color.
+- Do not use "pale skin" as a fallback.
+- Do not describe clothing or outfit items.
+- Do not add background, camera, pose, quality tags, style tags, nsfw, nudity, sex acts, or negative prompts.
+- Keep fields practical for the existing character form.
+- If a field is not needed, use an empty string.
+- Set sex and age explicitly based on the user's description. If unspecified, infer a reasonable adult character.
+
+Example:
+{{
+  "sex": "female",
+  "age": 24,
+  "race": "demon",
+  "skin_color": "",
+  "body": "medium_breasts, slim waist",
+  "face": "beauty mark below one eye, high cheekbones",
+  "hair": "white hair, waist-length hair, blunt bangs",
+  "eyes": "red eyes, luminous irises",
+  "additional_details": "geometric body tattoos, black fingernails"
+}}
+"""
+    return system_prompt, user_prompt
+
+
 def normalize_overhaul_strength(value):
     try:
         strength = float(value)
@@ -1949,6 +2092,33 @@ if server:
             if not user_description:
                 return web.Response(status=400, text="No character description provided")
 
+            tag_options = _extract_character_tag_options(CHARACTER_PRESETS)
+            system_prompt, user_prompt = _build_character_wizard_prompts(user_description, tag_options)
+
+            backend = _load_wizard_backend_config()
+            if backend.get("enabled"):
+                started = time.time()
+                try:
+                    content, model_used = _wizard_via_remote(system_prompt, user_prompt, backend)
+                    log_event("wizard_remote_backend", component="Creator", model=model_used,
+                              elapsed=round(time.time() - started, 1), truncate=False)
+                    parsed = _parse_character_wizard_json(content or "")
+                    if parsed is not None:
+                        parsed = postprocess_character_wizard_result(parsed, user_description)
+                        return web.json_response(parsed)
+                    remote_error = "remote wizard returned unparseable JSON"
+                except Exception as e:
+                    remote_error = str(e)
+                if not backend.get("native_fallback", True):
+                    return web.json_response({
+                        "error": "REMOTE_BACKEND_ERROR",
+                        "message": remote_error,
+                        "model_name": str(backend.get("model", "")),
+                    }, status=502)
+                log_event("wizard_remote_fallback", component="Creator", level="warn",
+                          message=f"remote wizard backend failed, using local GGUF: {remote_error}",
+                          truncate=False)
+
             try:
                 model_path = _ensure_character_wizard_model()
             except Exception as e:
@@ -1966,64 +2136,6 @@ if server:
                     "message": f"Qwen GGUF model file is invalid or incomplete: {e}",
                     "model_name": os.path.basename(model_path),
                 }, status=422)
-
-            tag_options = _extract_character_tag_options(CHARACTER_PRESETS)
-
-            system_prompt = (
-                "You are a professional anime/game character designer. "
-                "Convert broad character ideas into concise structured character fields. "
-                "Output valid JSON only."
-            )
-            user_prompt = f"""
-Create a character from this abstract idea:
-{user_description}
-
-Use these curated presets when they fit. Free-form descriptions are also supported; keep breast/chest size tags exactly as listed:
-{json.dumps(tag_options, ensure_ascii=False)}
-
-Use one of these skin_color values only when the user's idea explicitly mentions skin tone or complexion:
-{json.dumps(SKIN_COLOR_OPTIONS, ensure_ascii=False)}
-
-Return a raw JSON object with exactly these keys:
-- sex: "male" or "female"
-- age: integer from 1 to 100
-- race
-- skin_color
-- body
-- face
-- hair
-- eyes
-- additional_details
-
-Rules:
-- Use comma-separated prompt fragments for text fields.
-- The race field is for species/fantasy traits only. For normal humans set race to "human".
-- Never put ethnicity, nationality, profession, role, clothing, or archetype in race. Examples of invalid race values: "afro_student", "black student", "asian girl", "teacher".
-- Put skin tone in skin_color, not race. "afro", "African", "African-American", "black", or similar means skin_color should be "dark skin" unless another skin tone is explicit.
-- For body, always provide a visible body/build descriptor. Use listed breast/chest tags when relevant, and add concise build phrases like "slim build", "average build", "athletic build" when useful.
-- For race, use a listed species name when it fits; its visual features are added automatically.
-- For other fields, prefer concise natural-language descriptions from the presets when they fit.
-- For skin_color, do not guess a default. Use an empty string unless the user's idea explicitly mentions skin tone, complexion, or non-human skin color.
-- Do not use "pale skin" as a fallback.
-- Do not describe clothing or outfit items.
-- Do not add background, camera, pose, quality tags, style tags, nsfw, nudity, sex acts, or negative prompts.
-- Keep fields practical for the existing character form.
-- If a field is not needed, use an empty string.
-- Set sex and age explicitly based on the user's description. If unspecified, infer a reasonable adult character.
-
-Example:
-{{
-  "sex": "female",
-  "age": 24,
-  "race": "demon",
-  "skin_color": "",
-  "body": "medium_breasts, slim waist",
-  "face": "beauty mark below one eye, high cheekbones",
-  "hair": "white hair, waist-length hair, blunt bangs",
-  "eyes": "red eyes, luminous irises",
-  "additional_details": "geometric body tattoos, black fingernails"
-}}
-"""
 
             log_stage("loading_wizard_model", component="Creator", model=os.path.basename(model_path))
             llm = llama_cpp.Llama(
