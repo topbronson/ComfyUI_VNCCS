@@ -886,6 +886,185 @@ Example:
     return system_prompt, user_prompt
 
 
+# --- Character Wizard assist workspace (POST /vnccs/wizard/assist) ---
+
+ASSIST_ACTIONS = ("draft", "reroll_field", "polish_field", "edit_command", "names", "review")
+ASSIST_TEXT_FIELDS = ("race", "skin_color", "body", "breast_size", "face", "hair", "eyes", "additional_details")
+ASSIST_PATCH_KEYS = ASSIST_TEXT_FIELDS + ("sex", "age")
+ASSIST_MAX_INSTRUCTION = 2000
+ASSIST_MAX_DRAFT_JSON = 4096
+ASSIST_REMOTE_TIMEOUT_DEFAULT = 30.0
+_BREAST_SIZE_TAG_RE = re.compile(
+    r"^(?:flat chest|(?:small|medium|large|huge|big) breasts|breasts|alternate breast size \(larger\))$",
+    re.IGNORECASE,
+)
+_NAME_TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 .'\-]{0,39}$")
+
+# The substantive wizard rules live in the user prompt, not the 3-line system
+# prompt. Every assist prompt must carry them or those paths ship unfiltered.
+WIZARD_RULES_BLOCK = """Rules:
+- The race field is for species/fantasy traits only. For normal humans set race to "human".
+- Never put ethnicity, nationality, profession, role, clothing, or archetype in race. Examples of invalid race values: "afro_student", "black student", "asian girl", "teacher".
+- Put skin tone in skin_color, not race. "afro", "African", "African-American", "black", or similar means skin_color should be "dark skin" unless another skin tone is explicit.
+- For skin_color, do not guess a default. Use an empty string unless the user's idea explicitly mentions skin tone, complexion, or non-human skin color. Do not use "pale skin" as a fallback.
+- Do not describe clothing or outfit items.
+- Do not add background, camera, pose, quality tags, style tags, nsfw, nudity, sex acts, or negative prompts.
+- Keep fields practical for the existing character form.
+- If a field is not needed, use an empty string."""
+
+_ASSIST_INFLIGHT = set()
+
+
+def _clean_assist_text(value):
+    if isinstance(value, list):
+        value = ", ".join(str(item).strip() for item in value if str(item).strip())
+    elif value is None:
+        value = ""
+    elif not isinstance(value, str):
+        value = str(value)
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", value).strip()
+
+
+def _sanitize_assist_value(field, value, draft, description_ctx=""):
+    """Per-field filter for assist outputs. Never trust LLM text into a
+    draft-bearing field; same guard family as the one-shot wizard."""
+    value = _clean_assist_text(value)
+    if not value:
+        return ""
+    ctx = description_ctx or " ".join(
+        str(draft.get(k, "")) for k in ("additional_details", "face", "body")
+    )
+    if field == "race":
+        return _normalize_wizard_race(value, ctx)
+    if field == "skin_color":
+        return value if value.lower() in {s.lower() for s in SKIN_COLOR_OPTIONS} else ""
+    if field == "body":
+        sex = "male" if str(draft.get("sex", "female")).lower().startswith("m") else "female"
+        return _normalize_wizard_body(value, ctx, sex)
+    if field == "breast_size":
+        kept = [t.strip() for t in _split_prompt_tokens(value) if _BREAST_SIZE_TAG_RE.match(t.strip())]
+        return ", ".join(dict.fromkeys(kept))
+    tokens = _split_prompt_tokens(value)[:8]
+    return ", ".join(tokens)[:300]
+
+
+def _sanitize_assist_names(value, count):
+    kept = []
+    seen = set()
+    for item in (value if isinstance(value, list) else []):
+        name = _clean_assist_text(item)
+        if not name or not _NAME_TAG_RE.match(name):
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(name)
+        if len(kept) >= max(1, min(10, int(count))):
+            break
+    return kept
+
+
+def _validate_assist_request(post):
+    """Strict request validation before touching the shared inference lane."""
+    action = post.get("action")
+    if action not in ASSIST_ACTIONS:
+        return None, f"Unknown action: {str(action)[:40]!r}"
+    if action == "draft":
+        description = _clean_assist_text(post.get("description", ""))
+        if not description:
+            return None, "No character description provided"
+        if len(description) > ASSIST_MAX_INSTRUCTION:
+            return None, "description too long"
+        post["description"] = description
+        return post, None
+    draft = post.get("draft")
+    if not isinstance(draft, dict):
+        return None, "draft must be an object"
+    sex = _clean_assist_text(draft.get("sex", "female")).lower()
+    sex = "male" if sex.startswith("m") else "female"
+    try:
+        age = max(1, min(100, int(float(draft.get("age", 18)))))
+    except (TypeError, ValueError):
+        age = 18
+    clean_draft = {"sex": sex, "age": age}
+    for key in ASSIST_TEXT_FIELDS:
+        clean_draft[key] = _clean_assist_text(draft.get(key, ""))[:400]
+    if len(json.dumps(clean_draft, ensure_ascii=False)) > ASSIST_MAX_DRAFT_JSON:
+        return None, "draft too large"
+    post = dict(post)
+    post["draft"] = clean_draft
+    if action in ("reroll_field", "polish_field"):
+        if post.get("field") not in ASSIST_TEXT_FIELDS:
+            return None, f"invalid field: {str(post.get('field'))[:40]!r}"
+    instruction = _clean_assist_text(post.get("instruction", ""))
+    if len(instruction) > ASSIST_MAX_INSTRUCTION:
+        return None, "instruction too long"
+    post["instruction"] = instruction
+    if action == "edit_command" and not instruction:
+        return None, "edit_command requires an instruction"
+    try:
+        post["count"] = max(1, min(10, int(post.get("count", 5))))
+    except (TypeError, ValueError):
+        post["count"] = 5
+    return post, None
+
+
+def _build_assist_prompts(action, post):
+    system_prompt = (
+        "You are a professional anime/game character designer assisting with a "
+        "character draft form. Output valid JSON only."
+    )
+    if action == "draft":
+        # Exact parity with the one-shot wizard prompt.
+        return _build_character_wizard_prompts(
+            post["description"], _extract_character_tag_options(CHARACTER_PRESETS)
+        )
+    draft = post["draft"]
+    instruction = post.get("instruction", "")
+    extra = f"\nExtra instruction from the user: {instruction}\n" if instruction else ""
+    common = (
+        f"Current character draft (JSON):\n{json.dumps(draft, ensure_ascii=False)}\n\n"
+        f"{WIZARD_RULES_BLOCK}\n"
+    )
+    tag_options = json.dumps(_extract_character_tag_options(CHARACTER_PRESETS), ensure_ascii=False)
+    if action == "reroll_field":
+        field = post["field"]
+        user_prompt = common + f"""
+Propose 4 distinct alternative values for the "{field}" field of this character, keeping the overall concept coherent.
+{extra}Curated presets you may draw from: {tag_options}
+Return a raw JSON object with exactly one key:
+{{"suggestions": ["value1", "value2", "value3", "value4"]}}
+Each suggestion is the COMPLETE new value for the "{field}" field alone, as comma-separated prompt fragments."""
+    elif action == "polish_field":
+        field = post["field"]
+        user_prompt = common + f"""
+Rewrite ONLY the "{field}" field, current value: {draft.get(field, "")!r}
+Improve richness and clarity but KEEP the original concept and every trait it already mentions.
+{extra}Curated presets you may draw from: {tag_options}
+Return a raw JSON object with exactly one key:
+{{"value": "complete new value for the {field} field"}}"""
+    elif action == "edit_command":
+        user_prompt = common + f"""
+Apply this user instruction to the character draft: "{instruction}"
+Return the minimal patch as a raw JSON object:
+{{"patch": {{"<field>": "<complete new value>", ...}}, "note": "<optional short explanation>"}}
+Allowed field names: {", ".join(ASSIST_PATCH_KEYS)}.
+Each changed field must contain its COMPLETE new value (not a diff). Do not include fields the instruction does not change. If the instruction cannot be applied, return {{"patch": {{}}, "note": "why"}}."""
+    elif action == "names":
+        user_prompt = common + f"""
+Propose {post["count"]} fitting character names for this character (short, pronounceable, matching the concept and setting).
+Return a raw JSON object with exactly one key:
+{{"suggestions": ["Name 1", "Name 2", ...]}}"""
+    else:  # review
+        user_prompt = common + f"""
+Review this draft for internal inconsistencies and gaps: contradictory traits, species features mismatched with race, colors that clash, missing build descriptor, empty fields that clearly need a value.
+Return a raw JSON object with exactly one key:
+{{"issues": [{{"field": "<one of {', '.join(ASSIST_TEXT_FIELDS)}, or empty>", "note": "<short issue>", "suggestion": "<optional complete replacement value for that field>"}}]}}
+Do not rewrite the draft; only flag issues. If the draft is consistent, return {{"issues": []}}."""
+    return system_prompt, user_prompt
+
+
 def normalize_overhaul_strength(value):
     try:
         strength = float(value)
@@ -2079,15 +2258,6 @@ if server:
     @logged_operation("Creator", "wizard")
     def _character_wizard_response(post):
         try:
-            try:
-                import llama_cpp
-            except Exception as e:
-                return web.json_response({
-                    "error": "DEPENDENCY_MISSING",
-                    "message": f"llama-cpp-python is required for Character Wizard: {e}",
-                    "model_name": "llama-cpp-python",
-                }, status=500)
-
             user_description = str(post.get("description", "")).strip()
             if not user_description:
                 return web.Response(status=400, text="No character description provided")
@@ -2136,6 +2306,17 @@ if server:
                     "message": f"Qwen GGUF model file is invalid or incomplete: {e}",
                     "model_name": os.path.basename(model_path),
                 }, status=422)
+
+            # llama_cpp is only required when the local GGUF actually runs
+            # (remote disabled, or remote failed with native_fallback).
+            try:
+                import llama_cpp
+            except Exception as e:
+                return web.json_response({
+                    "error": "DEPENDENCY_MISSING",
+                    "message": f"llama-cpp-python is required for Character Wizard: {e}",
+                    "model_name": "llama-cpp-python",
+                }, status=500)
 
             log_stage("loading_wizard_model", component="Creator", model=os.path.basename(model_path))
             llm = llama_cpp.Llama(
@@ -2188,6 +2369,215 @@ if server:
         if not isinstance(post, dict):
             return web.json_response({"error": "Request must be an object"}, status=400)
         return await run_wizard_job(_character_wizard_response, post, "character")
+
+    @logged_operation("Creator", "wizard_assist")
+    def _wizard_assist_response(post):
+        try:
+            post, error = _validate_assist_request(post)
+            if post is None:
+                return web.json_response({"error": "INVALID_REQUEST", "message": error}, status=400)
+            action = post["action"]
+            system_prompt, user_prompt = _build_assist_prompts(action, post)
+
+            content = None
+            model_used = None
+            backend = _load_wizard_backend_config()
+            if backend.get("enabled"):
+                started = time.time()
+                try:
+                    assist_backend = dict(backend)
+                    assist_backend["timeout"] = float(backend.get(
+                        "assist_timeout",
+                        min(ASSIST_REMOTE_TIMEOUT_DEFAULT, float(backend.get("timeout", 120))),
+                    ))
+                    content, model_used = _wizard_via_remote(system_prompt, user_prompt, assist_backend)
+                    log_event("wizard_assist", component="Creator", action=action, model=model_used,
+                              elapsed=round(time.time() - started, 1), truncate=False)
+                except Exception as e:
+                    remote_error = str(e)
+                    if not backend.get("native_fallback", True):
+                        log_event("wizard_assist", component="Creator", action=action, level="warn",
+                                  model=str(backend.get("model", "")),
+                                  message=f"remote failed, no fallback: {remote_error}", truncate=False)
+                        return web.json_response({
+                            "error": "REMOTE_BACKEND_ERROR",
+                            "message": remote_error,
+                            "model_name": str(backend.get("model", "")),
+                        }, status=502)
+                    log_event("wizard_assist", component="Creator", action=action, level="warn",
+                              message=f"remote failed, using local GGUF: {remote_error}", truncate=False)
+
+            if content is None:
+                try:
+                    import llama_cpp
+                except Exception as e:
+                    return web.json_response({
+                        "error": "DEPENDENCY_MISSING",
+                        "message": f"llama-cpp-python is required for Character Wizard: {e}",
+                        "model_name": "llama-cpp-python",
+                    }, status=500)
+                try:
+                    model_path = _ensure_character_wizard_model()
+                except Exception as e:
+                    return web.json_response({
+                        "error": "MODEL_MISSING" if isinstance(e, FileNotFoundError) else "MODEL_INVALID",
+                        "message": str(e),
+                        "model_name": QWEN_VL_MODEL_FILENAME,
+                    }, status=500)
+                try:
+                    _validate_gguf_file(model_path, os.path.basename(model_path))
+                except Exception as e:
+                    return web.json_response({
+                        "error": "MODEL_INVALID",
+                        "message": f"Qwen GGUF model file is invalid or incomplete: {e}",
+                        "model_name": os.path.basename(model_path),
+                    }, status=422)
+                log_stage("loading_wizard_model", component="Creator", model=os.path.basename(model_path))
+                llm = llama_cpp.Llama(
+                    model_path=model_path,
+                    n_ctx=6144,
+                    n_gpu_layers=-1,
+                    verbose=False,
+                )
+                configure_qwen_text_chat(llm)
+                log_stage("generating_description")
+                response = llm.create_chat_completion(
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    max_tokens=900,
+                    temperature=0.3,
+                )
+                content = response["choices"][0]["message"]["content"]
+                model_used = os.path.basename(model_path)
+
+            log_stage("parsing_description")
+            if action == "draft":
+                parsed = _parse_character_wizard_json(content or "")
+                if parsed is None:
+                    return web.json_response({
+                        "error": "PARSE_ERROR",
+                        "message": "Failed to parse Character Wizard JSON output.",
+                        "raw": content or "",
+                    }, status=500)
+                parsed = postprocess_character_wizard_result(parsed, post["description"])
+                return web.json_response(parsed)
+
+            parsed = parse_wizard_json(content or "")
+            if not isinstance(parsed, dict):
+                return web.json_response({
+                    "error": "PARSE_ERROR",
+                    "message": "Failed to parse Character Wizard assist JSON output.",
+                    "raw": content or "",
+                }, status=500)
+
+            draft = post["draft"]
+            ctx = f"{draft.get('additional_details', '')} {post.get('instruction', '')}"
+            if action in ("reroll_field", "polish_field"):
+                field = post["field"]
+                if action == "polish_field":
+                    value = _sanitize_assist_value(field, parsed.get("value", ""), draft, ctx)
+                    if not value:
+                        return web.json_response({
+                            "error": "INVALID_OUTPUT",
+                            "message": "polish_field produced an empty or filtered-out value; try again.",
+                        }, status=500)
+                    return web.json_response({"value": value})
+                kept = []
+                for item in (parsed.get("suggestions") or [])[:8]:
+                    value = _sanitize_assist_value(field, item, draft, ctx)
+                    if value and value not in kept:
+                        kept.append(value)
+                return web.json_response({"suggestions": kept[:5]})
+
+            if action == "edit_command":
+                raw_patch = parsed.get("patch")
+                if not isinstance(raw_patch, dict):
+                    raw_patch = {}
+                cleaned_patch = {}
+                for key in ASSIST_PATCH_KEYS:
+                    if key not in raw_patch:
+                        continue
+                    if key == "sex":
+                        cleaned_patch["sex"] = (
+                            "male" if _clean_assist_text(raw_patch[key]).lower().startswith("m") else "female"
+                        )
+                    elif key == "age":
+                        try:
+                            cleaned_patch["age"] = max(1, min(100, int(float(raw_patch[key]))))
+                        except (TypeError, ValueError):
+                            continue
+                    else:
+                        value = _sanitize_assist_value(key, raw_patch[key], draft, ctx)
+                        if value or not _clean_assist_text(raw_patch[key]):
+                            cleaned_patch[key] = value
+                        # filtered-to-empty on non-empty input = unsafe suggestion, drop the key
+                note = _clean_assist_text(parsed.get("note", ""))[:200]
+                return web.json_response({"patch": cleaned_patch, "note": note})
+
+            if action == "names":
+                return web.json_response({"suggestions": _sanitize_assist_names(parsed.get("suggestions"), post["count"])})
+
+            # review: advisory only — never mutates the draft, but every
+            # clickable suggestion is filtered for its field first.
+            issues = []
+            for raw_issue in (parsed.get("issues") or [])[:8]:
+                if not isinstance(raw_issue, dict):
+                    continue
+                field = raw_issue.get("field")
+                field = field if field in ASSIST_TEXT_FIELDS else None
+                note = _clean_assist_text(raw_issue.get("note", ""))[:400]
+                suggestion = ""
+                if field:
+                    suggestion = _sanitize_assist_value(field, raw_issue.get("suggestion", ""), draft, ctx)
+                if note or suggestion:
+                    issue = {"note": note}
+                    if field:
+                        issue["field"] = field
+                    if suggestion:
+                        issue["suggestion"] = suggestion
+                    issues.append(issue)
+            return web.json_response({"issues": issues})
+        except Exception as e:
+            log_event('exception', component='Creator', level='error', exc_info=True, truncate=False, message='Operation failed', error=str(e))
+            return web.json_response({
+                "error": "INFERENCE_ERROR",
+                "message": f"Engine Error: {e}",
+                "model_name": QWEN_VL_MODEL_FILENAME,
+            }, status=500)
+
+    @server.PromptServer.instance.routes.post("/vnccs/wizard/assist")
+    @privileged_route
+    async def vnccs_wizard_assist(request):
+        try:
+            post = await request.json()
+        except (ValueError, TypeError):
+            return web.json_response({"error": "Invalid JSON request"}, status=400)
+        if not isinstance(post, dict):
+            return web.json_response({"error": "Request must be an object"}, status=400)
+        in_flight_key = f"{post.get('node_id', '')}:{post.get('request_id', '')}"
+        if in_flight_key in _ASSIST_INFLIGHT:
+            return web.json_response({
+                "error": "IN_FLIGHT",
+                "message": "An identical assist request is already queued or running.",
+            }, status=429)
+        _ASSIST_INFLIGHT.add(in_flight_key)
+        try:
+            return await run_wizard_job(_wizard_assist_response, post, "assist")
+        finally:
+            _ASSIST_INFLIGHT.discard(in_flight_key)
+
+    @server.PromptServer.instance.routes.get("/vnccs/character_wizard/backend")
+    @privileged_route
+    async def vnccs_character_wizard_backend(request):
+        cfg = _load_wizard_backend_config()
+        enabled = bool(cfg.get("enabled")) and bool(str(cfg.get("chat_url", "")).strip()) and bool(str(cfg.get("model", "")).strip())
+        return web.json_response({
+            "mode": "remote" if enabled else "local",
+            "model": str(cfg.get("model", "")) if enabled else QWEN_VL_MODEL_FILENAME,
+            "native_fallback": bool(cfg.get("native_fallback", True)),
+        })
 
     @logged_operation("Creator", "preview")
     def _generate_preview_response(data, style_preview=None):
