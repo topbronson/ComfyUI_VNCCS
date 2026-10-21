@@ -1,0 +1,300 @@
+"""Exercise stage events during work, without model loading or GPU sampling."""
+
+import json
+from types import SimpleNamespace
+
+import pytest
+
+torch = pytest.importorskip("torch")
+
+from nodes import character_generator as cg
+
+
+@pytest.fixture
+def generator(monkeypatch):
+    node = cg.VNCCS_CharacterGenerator()
+    values = {
+        "clip": "clip", "vae": "vae", "audio_vae": "audio_vae", "model": "model",
+        "seed": 42, "steps": 4, "cfg": 1.0, "sampler": "euler", "scheduler": "simple",
+        "model_kind": "qi2",
+    }
+    monkeypatch.setattr(node, "_extract_pipe", lambda pipe: values)
+    monkeypatch.setattr(node, "_apply_pose_lora_to_model", lambda model, *args: model)
+    monkeypatch.setattr(node, "_apply_lora_to_model", lambda model, *args: model)
+    monkeypatch.setattr(node, "_validate_conditioning_for_model", lambda *args: None)
+    monkeypatch.setattr(cg, "VNCCS_MaskExtractor", type("MaskExtractor", (), {"fill_alpha_with_color": staticmethod(lambda image: (image,))}))
+    events = []
+
+    def capture(name, payload):
+        assert name == "vnccs.character_generator.stage"
+        events.append(payload)
+
+    monkeypatch.setattr(cg.server.PromptServer.instance, "send_sync", capture, raising=False)
+    return node, values, events
+
+
+@pytest.mark.parametrize("kind", ["qi2", "klein9b", "minimaxh3"])
+@pytest.mark.parametrize("stage,count", [("pose_generation", 12), ("original_pose_generation", 2), ("naked_pose_generation", 1)])
+def test_pose_progress_tracks_each_phase_and_item(generator, monkeypatch, kind, stage, count):
+    node, values, events = generator
+    values["model_kind"] = kind
+    calls = []
+    phases = {
+                "VNCCS_Flux_Klein_Encoder": "Encoding poses",
+        "MiniMaxH3ReferenceToVideo": "Encoding poses",
+        "KSampler": "Sampling poses",
+        "SamplerCustomAdvanced": "Sampling poses",
+        "VAEDecodeTiled": "Decoding poses",
+        "VAEDecode": "Decoding poses",
+        "ProbeEncode": "Encoding poses",
+        "ProbeSample": "Sampling poses",
+        "ProbeDecode": "Decoding poses",
+    }
+    completed = dict.fromkeys(phases.values(), 0)
+    image = torch.zeros(1, 8, 8, 3)
+
+    def call(class_name, **kwargs):
+        assert "progress_callback" not in kwargs
+        phase = phases.get(class_name)
+        if phase:
+            # The event must arrive before this expensive operation. Counts
+            # advance only after its successful return, never optimistically.
+            event = next(event for event in reversed(events) if event["message"] == phase)
+            assert event["current"] == completed[phase]
+            assert events[-1]["total"] == count
+            if kind == "qi2":
+                active = events[-1].get("processing_index", events[-1]["current"])
+                assert active == completed[phase]
+            completed[phase] += 1
+            calls.append(class_name)
+        if class_name in {"VNCCS_Flux_Klein_Encoder", "ProbeEncode"}:
+            return "positive", "negative", "latent"
+        if class_name == "MiniMaxH3ReferenceToVideo":
+            return "positive", {"samples": torch.zeros(1, 24, 2, 4, 4)}
+        if class_name == "SamplerCustomAdvanced":
+            return ({"samples": torch.zeros(1, 24, 2, 4, 4)},)
+        if class_name in {"VAEDecodeTiled", "VAEDecode", "ProbeDecode"}:
+            if kind == "minimaxh3":
+                assert kwargs["samples"]["samples"].shape == (1, 24, 1, 4, 4)
+            return (image,)
+        return ("result",)
+
+    monkeypatch.setattr(cg, "_call_comfy_node", call)
+    monkeypatch.setattr(node, "_qi2_prepare_model", lambda model, *args: (model, False))
+    monkeypatch.setattr(node, "_qi2_encode", lambda *args, **kwargs: call("ProbeEncode"))
+    monkeypatch.setattr(node, "_qi2_sample", lambda *args, **kwargs: call("ProbeSample")[0])
+    monkeypatch.setattr(node, "_qi2_decode", lambda *args, **kwargs: call("ProbeDecode")[0])
+    result = node._run_pose_generation(
+        image.repeat(count, 1, 1, 1), image, object(), "Pose prompt", {},
+        unique_id="node-17", stage=stage, lora_info={"name": "Pose LoRA"},
+    )
+    expected = [(phase, index) for phase in completed for index in range(count + 1)]
+    progress_events = [event for event in events if event["message"] in completed]
+    actual = [(event["message"], event["current"]) for event in progress_events]
+    if kind == "qi2":
+        expected = [(phase, 0) for phase in completed] + [(phase, index) for index in range(1, count + 1) for phase in completed]
+    assert actual == expected
+    for event in progress_events:
+        assert event["node_id"] == "node-17"
+        assert event["stage"] == stage
+        assert event["status"] == "running"
+        assert event["lora_info"] == {"name": "Pose LoRA"}
+        assert "images" not in event
+    expected_calls = ([phase for _ in range(count) for phase in completed] if kind == "qi2"
+                      else [phase for phase in completed for _ in range(count)])
+    assert [phases[name] for name in calls] == expected_calls
+    assert result.shape == (count, 8, 8, 3)
+
+
+def test_chroma_preview_indices_identify_the_actual_emotion_sub_batch(generator, monkeypatch):
+    node, _, events = generator
+    images = torch.zeros(2, 8, 8, 3)
+
+    def chroma(*args, **kwargs):
+        assert events[-1]["processing_indices"] == [4, 5]
+        return (images,)
+
+    monkeypatch.setattr(cg.VNCCSChromaKey, "chroma_key", chroma)
+    assert node._run_bg_remove(images, {}, unique_id="node-17", preview_indices=[4, 5]) is images
+    assert events[-1]["processing_indices"] == []
+
+
+def test_failed_item_does_not_advance_progress_or_run_decode(generator, monkeypatch):
+    node, _, events = generator
+    calls = []
+
+    def sample(class_name, **kwargs):
+        calls.append(kwargs["item"])
+        if kwargs["item"] == 2:
+            raise RuntimeError("Sampling interrupted")
+        return (kwargs["item"],)
+
+    monkeypatch.setattr(cg, "_call_comfy_node", sample)
+    with pytest.raises(RuntimeError, match="Sampling interrupted"):
+        node._run_list_mapped(
+            "KSampler", {"item": [0, 1, 2, 3]},
+            progress_callback=node._stage_progress_callback("node-17", "pose_generation", "Sampling poses"),
+        )
+    assert calls == [0, 1, 2]
+    assert [event["current"] for event in events] == [0, 1, 2]
+    assert all(event["status"] == "running" for event in events)
+
+
+def test_initial_pose_batch_publishes_each_sprite_when_it_finishes(generator, monkeypatch):
+    node, values, events = generator
+    values["model_kind"] = "qi2"
+    image = torch.zeros(1, 8, 8, 3)
+    decoded = []
+
+    monkeypatch.setattr(node, "_qi2_prepare_model", lambda model, *args: (model, False))
+    monkeypatch.setattr(node, "_qi2_encode", lambda *args, **kwargs: ("positive", "negative", "latent"))
+    monkeypatch.setattr(node, "_qi2_sample", lambda *args, **kwargs: "samples")
+
+    def decode(*args, **kwargs):
+        result = torch.full_like(image, len(decoded) + 1)
+        decoded.append(result)
+        return result
+
+    monkeypatch.setattr(node, "_qi2_decode", decode)
+    monkeypatch.setattr(
+        cg, "_tensor_to_preview_urls",
+        lambda images, *args, start_index=0, **kwargs: [f"preview-{start_index}.png"],
+    )
+
+    result = node._run_pose_generation(
+        image.repeat(3, 1, 1, 1), image, object(), ["one", "two", "three"], {},
+        unique_id="node-17", publish_each=True, preview_cache_dir="cache",
+    )
+
+    published = [event for event in events if event.get("replace_images")]
+    assert result.shape == (3, 8, 8, 3)
+    assert [event["preview_start"] for event in published] == [0, 1, 2]
+    assert [event["images"] for event in published] == [
+        ["preview-0.png"], ["preview-1.png"], ["preview-2.png"],
+    ]
+    assert [event["current"] for event in published] == [1, 2, 3]
+    assert all(event["total"] == 3 for event in published)
+    assert [event.get("processing_index") for event in published] == [1, 2, None]
+    phase_events = [event for event in events if event["message"] in {"Encoding poses", "Sampling poses", "Decoding poses"}]
+    assert phase_events and all(event["total"] == 3 for event in phase_events)
+    assert all(0 <= event.get("processing_index", 0) < 3 for event in phase_events)
+
+
+@pytest.mark.parametrize("stage_prefix", ["original", "naked"])
+def test_clone_pose_branch_does_not_replace_incremental_previews_on_done(monkeypatch, stage_prefix):
+    node = cg.VNCCS_CharacterCloneGenerator()
+    images = torch.zeros(3, 8, 8, 3)
+    events = []
+
+    monkeypatch.setattr(node, "_should_regenerate_stage", lambda *args: True)
+    monkeypatch.setattr(node, "_run_pose_generation", lambda *args, **kwargs: images)
+    monkeypatch.setattr(node, "_run_upscaler", lambda batch, *args, **kwargs: batch)
+    monkeypatch.setattr(node, "_run_bg_remove", lambda batch, *args, **kwargs: batch)
+    monkeypatch.setattr(node, "_save_stage", lambda *args, **kwargs: None)
+    monkeypatch.setattr(node, "_extract_pipe", lambda *args: {"seed": 1})
+    monkeypatch.setattr(node, "_bg_remove_disabled", lambda *args: True)
+    monkeypatch.setattr(
+        node,
+        "_emit",
+        lambda unique_id, stage, status, images=None, *args, **kwargs: events.append({
+            "stage": stage, "status": status, "images": images,
+        }),
+    )
+
+    node._run_sprite_branch(
+        images, images[:1], object(), "prompt", "Green", node._settings("{}"),
+        "17", "", stage_prefix, {},
+    )
+
+    pose_stage = f"{stage_prefix}_pose_generation"
+    done = next(event for event in events if event["stage"] == pose_stage and event["status"] == "done")
+    assert done["images"] is None
+
+
+def test_remove_clothes_reports_encoding_sampling_and_decoding(generator, monkeypatch):
+    node, values, events = generator
+    values["model_kind"] = "klein9b"
+    image = torch.zeros(1, 8, 8, 3)
+
+    def encode(*args, **kwargs):
+        assert events[-1]["message"] == "Encoding source character"
+        return "positive", "negative", "latent"
+
+    def call(class_name, **kwargs):
+        expected = "Sampling source character" if class_name == "KSampler" else "Decoding source character"
+        assert events[-1]["message"] == expected
+        assert events[-1]["current"] == 0
+        return (image,)
+
+    monkeypatch.setattr(node, "_encoder_call", encode)
+    monkeypatch.setattr(cg, "_call_comfy_node", call)
+    assert node._run_remove_clothes(image, object(), {}, unique_id="node-17") is image
+    assert [(e["message"], e["current"]) for e in events] == [
+        (f"{phase} source character", current)
+        for phase in ("Encoding", "Sampling", "Decoding") for current in (0, 1)
+    ]
+    assert all(e["stage"] == "remove_clothes" and e["node_id"] == "node-17" for e in events)
+
+
+@pytest.mark.parametrize("mode", ["character", "clothes", "original", "naked"])
+@pytest.mark.parametrize("regenerate_index", [None, 2])
+def test_entry_points_forward_node_stage_and_actual_pose_count(monkeypatch, tmp_path, mode, regenerate_index):
+    node_type = {
+        "character": cg.VNCCS_CharacterGenerator,
+        "clothes": cg.VNCCS_ClothesGenerator,
+        "original": cg.VNCCS_CharacterCloneGenerator,
+        "naked": cg.VNCCS_CharacterCloneGenerator,
+    }[mode]
+    node = node_type()
+    stage = f"{mode}_pose_generation" if mode in {"original", "naked"} else "pose_generation"
+    poses = torch.zeros(4, 8, 8, 3)
+    events = []
+    for name in ("_remember_generator_context", "_rotate_preview_cache", "_save_run_inputs"):
+        monkeypatch.setattr(cg, name, lambda *args, **kwargs: None)
+    monkeypatch.setattr(cg, "_character_cache_dir_from_sheets_path", lambda *args: "")
+    monkeypatch.setattr(cg, "_load_run_inputs", lambda *args: {})
+    monkeypatch.setattr(cg, "_tensor_to_preview_urls", lambda *args, **kwargs: [])
+    monkeypatch.setattr(node, "_save_stage", lambda *args: None)
+    monkeypatch.setattr(node, "_load_cached_stage", lambda *args: None)
+    monkeypatch.setattr(node, "_extract_pipe", lambda *args: {"seed": 42})
+    monkeypatch.setattr(node, "_find_pose_lora", lambda *args: {})
+    monkeypatch.setattr(cg.server.PromptServer.instance, "send_sync", lambda name, payload: events.append(payload), raising=False)
+    if mode == "clothes":
+        import utils
+        monkeypatch.setattr(utils, "base_output_dir", lambda: str(tmp_path))
+        utils.save_costume_info("Alice", "Coat", {})
+        monkeypatch.setattr(node, "_run_source_upscaler", lambda image, *args, **kwargs: image)
+
+    class ReachedPoseGeneration(Exception):
+        pass
+
+    def run(poses, *args, **kwargs):
+        assert kwargs["unique_id"] == "17"
+        assert kwargs.get("stage", "pose_generation") == stage
+        assert events[-1]["stage"] == stage
+        assert events[-1]["node_id"] == "17"
+        assert events[-1]["total"] == poses.shape[0] == (1 if regenerate_index is not None else 4)
+        if mode == "clothes":
+            assert kwargs["background"] == "Green"
+            if regenerate_index is None:
+                assert "images" not in events[-1]
+                base_preview = next(event for event in events if event["stage"] == stage and event["status"] == "waiting")
+                assert "images" not in base_preview
+                assert base_preview["total"] == 4
+            else:
+                assert "images" not in events[-1]
+        raise ReachedPoseGeneration
+
+    monkeypatch.setattr(node, "_run_pose_generation", run)
+    with pytest.raises(ReachedPoseGeneration):
+        if mode in {"original", "naked"}:
+            node._run_sprite_branch(
+                poses, poses[:1], object(), "prompt", "Green", node._settings("{}"),
+                "17", "", mode, {}, regenerate_index=regenerate_index,
+            )
+        else:
+            payload = {} if regenerate_index is None else {"regenerate_from": stage, "regenerate_index": regenerate_index}
+            if mode == "clothes":
+                payload["character_name"] = "Alice"
+                payload["costume"] = "Coat"
+            node.process(poses, poses[:1], object(), "prompt", widget_data=json.dumps(payload), unique_id=["17"])

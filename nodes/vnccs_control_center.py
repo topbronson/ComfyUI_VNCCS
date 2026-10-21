@@ -1,0 +1,2573 @@
+from ..operation_logger import log_event, log_stage, logged_operation
+
+from .preview_runtime import run_preview_job
+from .runtime_cleanup import inference_stage
+from .h3_still import h3_runtime_status, require_h3_still_support
+from .progress_state import _valid_scope
+import json
+import math
+import os
+import io
+import base64
+import queue
+import threading
+import time
+import inspect
+import re
+import platform
+import tempfile
+import configparser
+import ipaddress
+from weakref import WeakValueDictionary
+from functools import lru_cache
+
+import folder_paths
+import comfy.sd
+import comfy.utils
+import server
+from aiohttp import web
+from huggingface_hub import hf_hub_download
+from PIL import Image
+import numpy as np
+import struct
+
+try:
+    from comfy.cli_args import args as comfy_cli_args
+except Exception:
+    comfy_cli_args = None
+
+try:
+    from ..utils import (
+        basename_agnostic,
+        get_full_path_agnostic,
+        is_absolute_path_any_os,
+        normalize_filesystem_path,
+        validate_privileged_request,
+        privileged_route,
+        atomic_output_path, character_storage_lock,
+        safe_join_under,
+    )
+except Exception:
+    from utils import (
+        basename_agnostic,
+        get_full_path_agnostic,
+        is_absolute_path_any_os,
+        normalize_filesystem_path,
+        validate_privileged_request,
+        privileged_route,
+        atomic_output_path, character_storage_lock,
+        safe_join_under,
+    )
+
+
+_CC_CONFIG_CACHE = {}
+_CC_CONFIG_REQUESTS = {}
+_CC_CONFIG_SYNC_LOCK = threading.RLock()
+_MODEL_ASSET_CACHE = {}
+_MODEL_ASSET_LOCK = threading.RLock()
+_DOWNLOAD_STATUS = {}
+_DOWNLOAD_TARGETS = {}
+_DOWNLOAD_QUEUE = queue.Queue()
+_DOWNLOAD_QUEUE_LOCK = threading.Lock()
+_CUSTOM_LORAS_FILE = "vnccs_custom_loras.json"
+_PACKAGED_CC_REPO_IDS = {"MIUProject/VNCCS_v3.0"}
+DEFAULT_QI2_MODEL = "Qwen Image 2.1 INT8 ConvRot"
+QI2_TURBO_MODEL_NAME = "qwen_image_2.1_turbo_int8_convrot.safetensors"
+QI2_CACHE_DEFAULTS = {"device": "gpu", "dtype": "int8"}
+_PIPELINE_LOCAL_LORAS = {
+    "clothescore",
+    "vnccs clothes core",
+    "vnccs pose studio qi2",
+    "qwen image 2.1 viggle turbo",
+    "vnccs clothes core klein9b",
+    "vnccs pose studio klein9b",
+    "h3_posestudio",
+    "minimax h3 pose studio",
+}
+_FOLDER_MAP = {
+    "unet": ["unet", "diffusion_models"],
+    "diffusion_models": ["diffusion_models", "unet"],
+    "checkpoints": ["checkpoints"],
+    "loras": ["loras"],
+    "clip": ["clip"],
+    "text_encoders": ["text_encoders", "clip"],
+    "vae": ["vae"],
+    "controlnet": ["controlnet"],
+    "upscale_models": ["upscale_models"],
+    "embeddings": ["embeddings"],
+    "gguf": ["unet", "diffusion_models"],
+    "diffusion_models": ["diffusion_models", "unet"],
+}
+_MODEL_FILE_EXTENSIONS = {".safetensors", ".gguf", ".ckpt", ".pt", ".pth", ".bin"}
+_MIN_MODEL_FILE_SIZE = 1024
+_SAFETENSORS_MAX_INDEX = (1 << 64) - 1
+_SAFETENSORS_DTYPE_BITS = {
+    "F4": 4, "F6_E2M3": 6, "F6_E3M2": 6,
+    "BOOL": 8, "U8": 8, "I8": 8, "F8_E5M2": 8, "F8_E4M3": 8,
+    "F8_E8M0": 8, "F8_E4M3FNUZ": 8, "F8_E5M2FNUZ": 8,
+    "I16": 16, "U16": 16, "F16": 16, "BF16": 16,
+    "I32": 32, "U32": 32, "F32": 32,
+    "I64": 64, "U64": 64, "F64": 64, "C64": 64,
+}
+_DEFAULT_MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024 * 1024
+_MANAGER_CONFIG_MAX_BYTES = 1024 * 1024
+_MANAGER_INSTALL_SECURITY_LEVELS = {"weak", "normal", "normal-"}
+DEFAULT_MODEL_STEPS = 4
+DEFAULT_MODEL_CFG = 1.0
+DEFAULT_MODEL_SCHEDULER = "simple"
+NUNCHAKU_DISABLED_MESSAGE = (
+    "Nunchaku support is disabled in VNCCS. Use native UNet models instead."
+)
+CLASSIC_GGUF_FOLDER = "ComfyUI-GGUF"
+GGUF_FORK_WARNING = (
+    "A non-standard GGUF loader is active. Stable VNCCS operation is only tested "
+    "with github.com/city96/ComfyUI-GGUF."
+)
+
+
+def _manager_config_path():
+    """Return ComfyUI-Manager's version-independent per-user config path."""
+    get_system_dir = getattr(folder_paths, "get_system_user_directory", None)
+    if callable(get_system_dir):
+        manager_dir = get_system_dir("manager")
+    else:
+        get_user_dir = getattr(folder_paths, "get_user_directory", None)
+        if not callable(get_user_dir):
+            raise RuntimeError("The ComfyUI user directory is unavailable.")
+        manager_dir = os.path.join(get_user_dir(), "__manager")
+
+    manager_dir = os.path.abspath(os.fspath(manager_dir))
+    if not manager_dir:
+        raise RuntimeError("The ComfyUI-Manager directory is unavailable.")
+    return os.path.join(manager_dir, "config.ini")
+
+
+def _read_manager_config_text(path=None):
+    path = path or _manager_config_path()
+    if not os.path.exists(path):
+        return ""
+    if os.path.islink(path):
+        raise RuntimeError("Refusing to modify a symlinked ComfyUI-Manager config.")
+    size = os.path.getsize(path)
+    if size > _MANAGER_CONFIG_MAX_BYTES:
+        raise RuntimeError("ComfyUI-Manager config is unexpectedly large.")
+    with open(path, "r", encoding="utf-8") as handle:
+        return handle.read(_MANAGER_CONFIG_MAX_BYTES + 1)
+
+
+def _parse_manager_policy(text):
+    network_mode = "public"
+    security_level = "normal"
+    if text.strip():
+        parser = configparser.ConfigParser(strict=False, interpolation=None)
+        try:
+            parser.read_string(text)
+            section_name = next(
+                (name for name in parser.sections() if name.lower() == "default"),
+                None,
+            )
+            if section_name:
+                section = parser[section_name]
+                network_mode = section.get("network_mode", network_mode).strip().lower()
+                security_level = section.get("security_level", security_level).strip().lower()
+        except configparser.Error as exc:
+            raise RuntimeError(f"ComfyUI-Manager config is invalid: {exc}") from exc
+    return network_mode, security_level
+
+
+def _manager_listener_address():
+    address = getattr(comfy_cli_args, "listen", None) if comfy_cli_args is not None else None
+    if address:
+        return str(address).strip()
+    instance = getattr(getattr(server, "PromptServer", None), "instance", None)
+    address = getattr(instance, "address", None)
+    if isinstance(address, (tuple, list)) and address:
+        address = address[0]
+    return str(address).strip() if address else None
+
+
+def _listener_is_loopback(address):
+    if not address:
+        return None
+    try:
+        return ipaddress.ip_address(address).is_loopback
+    except ValueError:
+        return False
+
+
+def _get_manager_install_policy(path=None, listen_address=None):
+    text = _read_manager_config_text(path)
+    network_mode, security_level = _parse_manager_policy(text)
+    address = listen_address if listen_address is not None else _manager_listener_address()
+    is_loopback = _listener_is_loopback(address)
+    security_allowed = security_level in _MANAGER_INSTALL_SECURITY_LEVELS
+    network_allowed = is_loopback is not False or network_mode == "personal_cloud"
+    return {
+        "network_mode": network_mode,
+        "security_level": security_level,
+        "listener": address or "unknown",
+        "listener_is_loopback": is_loopback,
+        "security_level_allows_install": security_allowed,
+        "install_allowed": security_allowed and network_allowed,
+        "requires_personal_cloud": security_allowed and is_loopback is False and not network_allowed,
+    }
+
+
+def _replace_manager_network_mode(text):
+    """Update only network_mode in [default], preserving unrelated config text."""
+    newline = "\r\n" if "\r\n" in text else "\n"
+    lines = text.splitlines(keepends=True)
+    section_re = re.compile(r"^\s*\[([^\]]+)\]\s*(?:[#;].*)?(?:\r?\n)?$")
+    option_re = re.compile(
+        r"^(\s*network_mode\s*[=:]\s*)([^#;\r\n]*?)(\s*(?:[#;].*)?)(\r?\n)?$",
+        re.IGNORECASE,
+    )
+
+    start = None
+    end = len(lines)
+    for index, line in enumerate(lines):
+        match = section_re.match(line)
+        if not match:
+            continue
+        if start is None and match.group(1).strip().lower() == "default":
+            start = index
+            continue
+        if start is not None:
+            end = index
+            break
+
+    if start is None:
+        prefix = text
+        if prefix and not prefix.endswith(("\n", "\r")):
+            prefix += newline
+        if prefix and not prefix.endswith(newline * 2):
+            prefix += newline
+        return f"{prefix}[default]{newline}network_mode = personal_cloud{newline}"
+
+    found = False
+    for index in range(start + 1, end):
+        match = option_re.match(lines[index])
+        if not match:
+            continue
+        line_ending = match.group(4) or (newline if lines[index].endswith(("\n", "\r")) else "")
+        suffix = match.group(3).strip()
+        if suffix.startswith(("#", ";")):
+            indentation = re.match(r"^\s*", match.group(1)).group(0)
+            lines[index] = (
+                f"{match.group(1)}personal_cloud{line_ending or newline}"
+                f"{indentation}{suffix}{line_ending}"
+            )
+        else:
+            lines[index] = f"{match.group(1)}personal_cloud{line_ending}"
+        found = True
+
+    if not found:
+        insertion = f"network_mode = personal_cloud{newline}"
+        if start == len(lines) - 1 and lines[start] and not lines[start].endswith(("\n", "\r")):
+            lines[start] += newline
+        lines.insert(end, insertion)
+    return "".join(lines)
+
+
+def _atomic_write_manager_file(path, content, mode=0o600):
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    file_descriptor, temp_path = tempfile.mkstemp(prefix=".vnccs-manager-", dir=directory)
+    try:
+        os.chmod(temp_path, mode)
+        with os.fdopen(file_descriptor, "w", encoding="utf-8", newline="") as handle:
+            file_descriptor = None
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if file_descriptor is not None:
+            os.close(file_descriptor)
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+def _enable_manager_personal_cloud(path=None):
+    path = path or _manager_config_path()
+    current = _read_manager_config_text(path)
+    network_mode, security_level = _parse_manager_policy(current)
+    if security_level not in _MANAGER_INSTALL_SECURITY_LEVELS:
+        raise RuntimeError(
+            "ComfyUI-Manager security_level must be normal or below. "
+            "VNCCS will not weaken that setting automatically."
+        )
+    if network_mode == "personal_cloud":
+        # Manager caches config at startup, so an already-updated file can still
+        # require a restart after a policy rejection from the running process.
+        return {"changed": False, "restart_required": True}
+
+    updated = _replace_manager_network_mode(current)
+    existing_mode = (os.stat(path).st_mode & 0o777) if os.path.exists(path) else 0o600
+    if current:
+        backup_path = f"{path}.vnccs-backup"
+        if not os.path.exists(backup_path):
+            _atomic_write_manager_file(backup_path, current, existing_mode)
+    _atomic_write_manager_file(path, updated, existing_mode)
+    return {"changed": True, "restart_required": True}
+
+def _get_node_class_mappings():
+    import nodes as comfy_nodes
+
+    return getattr(comfy_nodes, "NODE_CLASS_MAPPINGS", {})
+
+
+def _get_gguf_loader_class():
+    return _get_node_class_mappings().get("UnetLoaderGGUF")
+
+
+def _describe_gguf_loader(loader_cls=None):
+    loader_cls = loader_cls or _get_gguf_loader_class()
+    if loader_cls is None:
+        return {
+            "available": False,
+            "class_name": None,
+            "module": None,
+            "file": None,
+            "folder": None,
+            "is_classic": False,
+            "warning": None,
+        }
+
+    module_name = getattr(loader_cls, "__module__", "") or ""
+    class_name = getattr(loader_cls, "__name__", "UnetLoaderGGUF")
+    try:
+        loader_file = inspect.getfile(loader_cls)
+    except Exception:
+        loader_file = None
+
+    raw_parts = [part for part in os.path.normpath(loader_file).split(os.sep) if part] if loader_file else []
+    parts = [part.lower() for part in raw_parts]
+    classic_folder = CLASSIC_GGUF_FOLDER.lower()
+    folder = None
+    for index, part in enumerate(parts):
+        if part == "custom_nodes" and index + 1 < len(parts):
+            folder = raw_parts[index + 1]
+            break
+
+    module_tokens = {token for token in re.split(r"[^a-z0-9]+", module_name.lower()) if token}
+    is_classic = classic_folder in parts or module_name.lower() == "comfyui_gguf" or module_tokens == {"comfyui", "gguf"}
+    warning = None if is_classic else GGUF_FORK_WARNING
+
+    return {
+        "available": True,
+        "class_name": class_name,
+        "module": module_name,
+        "file": loader_file,
+        "folder": folder,
+        "is_classic": is_classic,
+        "warning": warning,
+    }
+
+
+def _detect_nunchaku_model_kind(model_entry=None, full_path=""):
+    # TECH DEBT: Nunchaku support is disabled. Delete this legacy helper after
+    # old saved workflows and tests no longer carry Nunchaku state.
+    entry_name = (model_entry.get("name", "") if model_entry else "").lower()
+    entry_path = (model_entry.get("local_path", "") if model_entry else "").lower()
+    identity = " ".join([entry_name, entry_path, full_path.lower()])
+    return "qwen-image" if "qwen" in identity else "flux"
+
+
+def _get_nunchaku_dependency_status(model_entry=None, full_path="", has_enabled_loras=False):
+    # TECH DEBT: Nunchaku dependency probing is intentionally commented out at
+    # runtime. Delete the legacy Nunchaku support once old workflow state is gone.
+    # Legacy behavior checked NODE_CLASS_MAPPINGS for:
+    # - NunchakuQwenImageDiTLoader / NunchakuFluxDiTLoader
+    # - NunchakuQwenImageLoraLoader / NunchakuFluxLoraLoader
+    return {
+        "model_kind": _detect_nunchaku_model_kind(model_entry=model_entry, full_path=full_path),
+        "loader_name": None,
+        "lora_loader_name": None,
+        "has_loader": False,
+        "has_lora_loader": False,
+        "has_enabled_loras": has_enabled_loras,
+        "ok": False,
+        "disabled": True,
+        "missing": [],
+        "message": NUNCHAKU_DISABLED_MESSAGE,
+    }
+
+
+def resolve_path(relative_path):
+    if not relative_path:
+        return ""
+    expanded = os.path.expanduser(relative_path)
+    normalized = normalize_filesystem_path(expanded)
+    if is_absolute_path_any_os(expanded):
+        return os.path.abspath(normalized)
+    base = getattr(folder_paths, "base_path", os.getcwd())
+    return os.path.abspath(os.path.join(base, normalized))
+
+
+def _control_center_data_path(filename, for_write=False):
+    """Resolve mutable Control Center state outside the ComfyUI code directory."""
+    get_user_directory = getattr(folder_paths, "get_user_directory", None)
+    if callable(get_user_directory):
+        try:
+            user_directory = get_user_directory()
+        except Exception:
+            user_directory = ""
+        if user_directory:
+            current = os.path.abspath(os.path.join(user_directory, "VNCCS", filename))
+            if for_write or os.path.exists(current):
+                return current
+
+    # Preserve configs created by older VNCCS releases and portable installs.
+    return resolve_path(filename)
+
+
+def _purge_legacy_download_credentials():
+    """Remove the obsolete Control Center secret store from every legacy location."""
+    filename = "vnccs_user_config.json"
+    candidates = {
+        _control_center_data_path(filename, for_write=True),
+        resolve_path(filename),
+    }
+    for path in candidates:
+        try:
+            if path and os.path.isfile(path):
+                os.remove(path)
+        except OSError as exc:
+            log_event('warning', component='ControlCenter', level='warning', message=f"Failed to remove obsolete secret store '{path}': {exc}", error=str(exc))
+
+
+_purge_legacy_download_credentials()
+
+
+def _models_root():
+    return os.path.abspath(getattr(folder_paths, "models_dir", os.path.join(getattr(folder_paths, "base_path", os.getcwd()), "models")))
+
+
+def _configured_model_folder(folder_type):
+    """Return ComfyUI's preferred folder for a catalog model category."""
+    for key in _FOLDER_MAP.get(folder_type, [folder_type]):
+        try:
+            paths = folder_paths.get_folder_paths(key) or []
+        except Exception:
+            paths = []
+        if paths:
+            return os.path.abspath(normalize_filesystem_path(paths[0]))
+    return os.path.join(_models_root(), folder_type)
+
+
+def _create_download_staging_file(target_path, model_key):
+    """Create a hidden partial file beside the target for an atomic final move."""
+    target_directory = os.path.dirname(target_path)
+    os.makedirs(target_directory, exist_ok=True)
+    sanitized_name = "".join(ch for ch in model_key if ch.isalnum()) or "model"
+    return tempfile.mkstemp(
+        prefix=f".vnccs_{sanitized_name}_",
+        suffix=".part",
+        dir=target_directory,
+    )
+
+
+def _custom_nodes_roots():
+    """Return every custom-node root registered with the running ComfyUI host."""
+    try:
+        roots = folder_paths.get_folder_paths("custom_nodes") or []
+    except Exception:
+        roots = []
+    if not roots:
+        roots = [os.path.join(getattr(folder_paths, "base_path", os.getcwd()), "custom_nodes")]
+
+    result = []
+    seen = set()
+    for root in roots:
+        normalized = os.path.abspath(normalize_filesystem_path(root))
+        key = os.path.normcase(normalized)
+        if key not in seen:
+            seen.add(key)
+            result.append(normalized)
+    return result
+
+
+def _registered_node_class(spec, mappings=None):
+    """Find a dependency only in ComfyUI's active node registry."""
+    mappings = mappings if mappings is not None else _get_node_class_mappings()
+    identifiers = [spec.get("node_id"), *spec.get("class_names", [])]
+    for identifier in identifiers:
+        if identifier and identifier in mappings:
+            return mappings[identifier]
+
+    class_names = set(spec.get("class_names", []))
+    for candidate in mappings.values():
+        if getattr(candidate, "__name__", None) in class_names:
+            return candidate
+    return None
+
+
+def _max_download_bytes():
+    return _DEFAULT_MAX_DOWNLOAD_BYTES
+
+
+def _validate_model_filename(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in _MODEL_FILE_EXTENSIONS:
+        allowed = ", ".join(sorted(_MODEL_FILE_EXTENSIONS))
+        raise ValueError(f"Unsupported model file extension '{ext}'. Allowed: {allowed}")
+    return ext
+
+
+def _resolve_model_download_path(local_path):
+    if not local_path:
+        raise ValueError("Model local_path is required")
+    normalized = str(local_path).strip().replace("\\", "/")
+    if is_absolute_path_any_os(normalized):
+        raise ValueError("Model local_path must be relative to ComfyUI models directory")
+    parts = [part for part in normalized.split("/") if part]
+    if len(parts) < 3 or parts[0] != "models":
+        raise ValueError("Model local_path must use 'models/<type>/<file>'")
+    if any(part in {".", ".."} for part in parts):
+        raise ValueError("Model local_path contains invalid path traversal")
+    folder_type = parts[1]
+    if folder_type not in _FOLDER_MAP:
+        raise ValueError(f"Unsupported model folder '{folder_type}'")
+    _validate_model_filename(parts[-1])
+    target_root = _configured_model_folder(folder_type)
+    return safe_join_under(target_root, *parts[2:])
+
+
+def _validate_downloaded_model_file(path, expected_name="model"):
+    size = os.path.getsize(path)
+    if size < _MIN_MODEL_FILE_SIZE:
+        raise ValueError(f"{expected_name} is too small to be a valid model file ({size} bytes)")
+
+    ext = _validate_model_filename(expected_name)
+    with open(path, "rb") as handle:
+        head = handle.read(256)
+
+    if head.lstrip().lower().startswith((b"<html", b"<!doctype html", b"<?xml")):
+        raise ValueError(f"{expected_name} looks like an HTML/XML response, not a model file")
+
+    if ext == ".gguf":
+        if head[:4] != b"GGUF":
+            raise ValueError(f"{expected_name} is not a valid GGUF file")
+        return True
+
+    if ext == ".safetensors":
+        if len(head) < 9:
+            raise ValueError(f"{expected_name} is not a valid safetensors file")
+        header_len = struct.unpack("<Q", head[:8])[0]
+        if header_len <= 0 or header_len > size - 8 or header_len > 100 * 1024 * 1024:
+            raise ValueError(f"{expected_name} has an invalid safetensors header")
+        with open(path, "rb") as handle:
+            handle.seek(8)
+            encoded_header = handle.read(header_len)
+        if not encoded_header.startswith(b"{"):
+            raise ValueError(f"{expected_name} has an invalid safetensors JSON header")
+
+        def unique_object(pairs):
+            result = dict(pairs)
+            if len(result) != len(pairs):
+                raise ValueError(f"{expected_name} has duplicate safetensors header keys")
+            return result
+
+        def invalid_constant(value):
+            raise ValueError(f"non-finite JSON value '{value}'")
+
+        try:
+            header = json.loads(encoded_header, object_pairs_hook=unique_object, parse_constant=invalid_constant)
+        except (ValueError, UnicodeError) as error:
+            raise ValueError(f"{expected_name} has an invalid safetensors JSON header: {error}") from error
+        if not isinstance(header, dict):
+            raise ValueError(f"{expected_name} has an invalid safetensors header")
+        ranges = []
+        for name, tensor in header.items():
+            if name == "__metadata__":
+                if not isinstance(tensor, dict) or any(not isinstance(value, str) for value in tensor.values()):
+                    raise ValueError(f"{expected_name} has invalid safetensors metadata")
+                continue
+            if not isinstance(tensor, dict):
+                raise ValueError(f"{expected_name} has invalid tensor metadata for '{name}'")
+            dtype, shape, offsets = tensor.get("dtype"), tensor.get("shape"), tensor.get("data_offsets")
+            if (not isinstance(dtype, str) or dtype not in _SAFETENSORS_DTYPE_BITS
+                    or not isinstance(shape, list) or any(type(dimension) is not int
+                        or not 0 <= dimension <= _SAFETENSORS_MAX_INDEX for dimension in shape)
+                    or not isinstance(offsets, list) or len(offsets) != 2
+                    or any(type(offset) is not int or not 0 <= offset <= _SAFETENSORS_MAX_INDEX for offset in offsets)):
+                raise ValueError(f"{expected_name} has invalid tensor metadata for '{name}'")
+            elements = 1
+            for dimension in shape:
+                elements *= dimension
+                if elements > _SAFETENSORS_MAX_INDEX:
+                    raise ValueError(f"{expected_name} has an overflowing tensor shape for '{name}'")
+            bits = elements * _SAFETENSORS_DTYPE_BITS[dtype]
+            start, end = offsets
+            if bits > _SAFETENSORS_MAX_INDEX or bits % 8 or end - start != bits // 8:
+                raise ValueError(f"{expected_name} has an invalid tensor size for '{name}'")
+            ranges.append((start, end))
+        # Every payload byte belongs to one tensor; gaps, overlaps and truncation are invalid.
+        covered = 0
+        for start, end in sorted(ranges):
+            if start != covered:
+                raise ValueError(f"{expected_name} has invalid safetensors tensor offsets")
+            covered = end
+        if covered != size - 8 - header_len:
+            raise ValueError(f"{expected_name} has incomplete or unindexed safetensors tensor data")
+        return True
+
+    if ext in {".ckpt", ".pt", ".pth", ".bin"}:
+        if not (head.startswith(b"PK\x03\x04") or head[:1] == b"\x80"):
+            raise ValueError(f"{expected_name} does not look like a PyTorch model checkpoint")
+        return True
+
+    return True
+
+
+def _get_custom_loras_path(for_write=False):
+    return _control_center_data_path(_CUSTOM_LORAS_FILE, for_write=for_write)
+
+
+def _load_custom_loras():
+    path = _get_custom_loras_path()
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return []
+    if isinstance(data, dict):
+        data = data.get("lora")
+    if (not isinstance(data, list) or any(not isinstance(entry, dict)
+            or not isinstance(entry.get("local_path"), str) or not entry["local_path"]
+            or not isinstance(entry.get("name", ""), str) for entry in data)):
+        raise ValueError("Invalid custom LoRA registry; repair it before saving")
+    return data
+
+
+def _save_custom_loras(entries):
+    path = _get_custom_loras_path(for_write=True)
+    with character_storage_lock(path):
+        current = _load_custom_loras()
+        by_path = {entry["local_path"].replace("\\", "/"): entry for entry in current}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            local_path = entry.get("local_path", "").replace("\\", "/")
+            if local_path:
+                by_path[local_path] = entry
+        with atomic_output_path(path) as temporary:
+            with open(temporary, "w", encoding="utf-8") as handle:
+                json.dump({"lora": list(by_path.values())}, handle, indent=2, ensure_ascii=False)
+
+
+def _remove_custom_lora(local_path=None, name=None):
+    normalized_path = (local_path or "").replace("\\", "/")
+    normalized_name = (name or "").strip().lower()
+    path = _get_custom_loras_path(for_write=True)
+    with character_storage_lock(path):
+        current = _load_custom_loras()
+        kept = [entry for entry in current
+                if not (entry["local_path"].replace("\\", "/") == normalized_path if normalized_path
+                        else normalized_name and entry.get("name", "").strip().lower() == normalized_name)]
+        with atomic_output_path(path) as temporary:
+            with open(temporary, "w", encoding="utf-8") as handle:
+                json.dump({"lora": kept}, handle, indent=2, ensure_ascii=False)
+        return len(kept) != len(current)
+
+
+def _build_custom_lora_name(rel_path, used_names=None):
+    used_names = {name.strip().lower() for name in (used_names or set())}
+    normalized = rel_path.replace("\\", "/").strip("/")
+    base_name = os.path.splitext(os.path.basename(normalized))[0]
+    candidate = base_name
+    parent = os.path.dirname(normalized)
+    if candidate.lower() in used_names and parent:
+        candidate = f"{base_name} ({parent})"
+    if candidate.lower() in used_names:
+        candidate = normalized
+
+    suffix = 2
+    unique = candidate
+    while unique.lower() in used_names:
+        unique = f"{candidate} [{suffix}]"
+        suffix += 1
+    return unique
+
+
+def _build_custom_lora_entry(rel_path, used_names=None, kind="Custom"):
+    normalized = rel_path.replace("\\", "/").strip("/")
+    if not normalized:
+        raise ValueError("LoRA path is empty")
+
+    full_path = get_full_path_agnostic(folder_paths, "loras", normalized, require_exists=True)
+    if not full_path or not os.path.exists(full_path):
+        raise FileNotFoundError(f"LoRA '{normalized}' not found in ComfyUI loras folder")
+
+    normalized_kind = str(kind or "Custom").strip() or "Custom"
+    return {
+        "name": _build_custom_lora_name(normalized, used_names=used_names),
+        "local_path": f"models/loras/{normalized}",
+        "type": "Custom",
+        "kind": normalized_kind,
+        "description": f"Custom LoRA from ComfyUI folder: {normalized}",
+        "custom": True,
+    }
+
+
+def _merge_custom_loras(config):
+    base_loras = list(config.get("lora", []))
+    merged = dict(config)
+    merged_loras = list(base_loras)
+    existing_paths = {
+        entry.get("local_path", "").replace("\\", "/")
+        for entry in base_loras
+        if isinstance(entry, dict) and entry.get("local_path")
+    }
+
+    for entry in _load_custom_loras():
+        if not isinstance(entry, dict):
+            continue
+        local_path = entry.get("local_path", "").replace("\\", "/")
+        if not local_path or local_path in existing_paths:
+            continue
+        merged_loras.append(entry)
+        existing_paths.add(local_path)
+
+    merged["lora"] = merged_loras
+    return merged
+
+
+def get_installed_version_info():
+    registry_path = _control_center_data_path("vnccs_installed_models.json")
+    if not os.path.exists(registry_path):
+        return {}
+    try:
+        with open(registry_path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError("Invalid installed model registry; repair it before saving")
+    return data
+
+
+def update_installed_version(model_name, version):
+    registry_path = _control_center_data_path("vnccs_installed_models.json", for_write=True)
+    with character_storage_lock(registry_path):
+        data = get_installed_version_info()
+        data[model_name] = version
+        with atomic_output_path(registry_path) as temporary:
+            with open(temporary, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2)
+
+
+def _get_packaged_cc_path():
+    """Keep the catalog beside this installed package, including linked checkouts."""
+    module_path = os.path.realpath(__file__)
+    return os.path.abspath(os.path.join(os.path.dirname(module_path), "..", "control_center.json"))
+
+
+def _uses_packaged_cc_config(repo_id):
+    return repo_id in _PACKAGED_CC_REPO_IDS and os.path.exists(_get_packaged_cc_path())
+
+
+def _sync_packaged_cc_config(repo_id, data):
+    if repo_id not in _PACKAGED_CC_REPO_IDS or not isinstance(data, dict):
+        return False
+
+    target = _get_packaged_cc_path()
+    tmp_path = None
+    try:
+        with _CC_CONFIG_SYNC_LOCK:
+            current = None
+            if os.path.exists(target):
+                try:
+                    with open(target, "r", encoding="utf-8") as handle:
+                        current = json.load(handle)
+                except Exception:
+                    current = None
+            if current == data:
+                return False
+
+            # A package renamed or removed after startup must not be recreated
+            # at its old path just to hold the catalog. Restart to load its new location.
+            if not os.path.isdir(os.path.dirname(target)):
+                raise FileNotFoundError("VNCCS installation directory is missing; restart ComfyUI after moving the package")
+            tmp_path = f"{target}.tmp.{os.getpid()}.{threading.get_ident()}"
+            with open(tmp_path, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2, ensure_ascii=False)
+                handle.write("\n")
+            os.replace(tmp_path, target)
+            log_event("catalog_updated", component="ControlCenter", repository=repo_id)
+            return True
+    except Exception as exc:
+        log_event('warning', component='ControlCenter', level='warning', message=f'Failed to update packaged catalog: {exc}', error=str(exc))
+        if tmp_path:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+        return False
+
+
+def _without_gan_upscalers(config):
+    """Retire generic GAN upscalers even in cached or older remote catalogs."""
+    result = dict(config)
+    for category in ("models", "clip", "vae", "lora", "controlnet", "other"):
+        if category not in config:
+            continue
+        result[category] = [
+            entry for entry in config[category]
+            if isinstance(entry, dict) and not any(
+                "upscale_models" in str(entry.get(key, "")).replace("\\", "/").lower().split("/")
+                for key in ("local_path", "hf_path")
+            )
+        ]
+    return result
+
+
+def _get_cc_config(repo_id, prefer_remote=False):
+    cached = _CC_CONFIG_CACHE.get(repo_id)
+    now = time.time()
+    if not prefer_remote and cached and now - cached.get("ts", 0) < 300:
+        return _dedupe_config_by_name(_without_gan_upscalers(_merge_custom_loras(cached["data"])))
+
+    request_id = object()
+    with _CC_CONFIG_SYNC_LOCK:
+        _CC_CONFIG_REQUESTS[repo_id] = request_id
+    source = "packaged"
+    if _uses_packaged_cc_config(repo_id) and not prefer_remote:
+        path = _get_packaged_cc_path()
+    else:
+        try:
+            path = hf_hub_download(
+                repo_id=repo_id,
+                filename="control_center.json",
+                local_files_only=False,
+                force_download=bool(prefer_remote),
+                token=False,
+            )
+            source = "huggingface"
+        except Exception as exc:
+            if not _uses_packaged_cc_config(repo_id):
+                raise
+            log_event('fallback', component='ControlCenter', level='warning', message=f'Remote catalog unavailable; using local catalog: {exc}', error=str(exc))
+            path = _get_packaged_cc_path()
+    with open(path, "r", encoding="utf-8") as handle:
+        data = _without_gan_upscalers(json.load(handle))
+    if source == "huggingface":
+        if _uses_packaged_cc_config(repo_id):
+            with open(_get_packaged_cc_path(), "r", encoding="utf-8") as handle:
+                packaged = json.load(handle)
+            data = dict(data)
+            for category in ("models", "clip", "vae", "lora"):
+                remote_entries = [e for e in data.get(category, []) if _entry_kind(e) != "qie2511"]
+                names = {e.get("name") for e in remote_entries}
+                additions = [
+                    e for e in packaged.get(category, [])
+                    if _entry_kind(e) == "qi2" and e.get("name") not in names
+                ]
+                data[category] = remote_entries + additions if category == "models" else additions + remote_entries
+    # An older remote response must not undo a newer refresh on disk or in memory.
+    with _CC_CONFIG_SYNC_LOCK:
+        if _CC_CONFIG_REQUESTS.get(repo_id) is request_id:
+            if source == "huggingface":
+                _sync_packaged_cc_config(repo_id, data)
+            _CC_CONFIG_CACHE[repo_id] = {"ts": now, "data": data, "source": source}
+    return _dedupe_config_by_name(_merge_custom_loras(data))
+
+
+def _get_cc_config_source(repo_id):
+    cached = _CC_CONFIG_CACHE.get(repo_id) or {}
+    return cached.get("source") or ("packaged" if _uses_packaged_cc_config(repo_id) else "huggingface")
+
+
+def _version_sort_key(version):
+    parts = []
+    for part in str(version or "").replace("-", ".").replace("_", ".").split("."):
+        if part.isdigit():
+            parts.append((1, int(part)))
+        elif part:
+            parts.append((0, part.lower()))
+    return tuple(parts)
+
+
+def _dedupe_entries_by_name(entries):
+    chosen = {}
+    order = []
+    for index, entry in enumerate(entries or []):
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name", "")).strip()
+        if not name:
+            order.append((index, entry))
+            continue
+        key = name.lower()
+        current = chosen.get(key)
+        candidate_rank = (_version_sort_key(entry.get("version")), index)
+        if current is None:
+            order.append((index, key))
+            chosen[key] = (entry, candidate_rank)
+            continue
+        if candidate_rank > current[1]:
+            chosen[key] = (entry, candidate_rank)
+
+    result = []
+    for _, item in order:
+        if isinstance(item, str):
+            entry = chosen.pop(item, (None, None))[0]
+            if entry is not None:
+                result.append(entry)
+        else:
+            result.append(item)
+    return result
+
+
+def _dedupe_config_by_name(config):
+    if not isinstance(config, dict):
+        return config
+    result = dict(config)
+    for category in ("models", "clip", "vae", "lora", "controlnet", "other"):
+        result[category] = _dedupe_entries_by_name(config.get(category, []))
+    return result
+
+
+def _enrich_config_entries(entries, category, installed=None):
+    installed = installed or {}
+    result = []
+    for entry in entries:
+        key = f"cc_{category}_{entry['name']}"
+        active_ver = installed.get(key)
+        _, on_disk = _find_model_on_disk(entry["local_path"])
+        target_ver = entry.get("version", "")
+        if on_disk and not active_ver:
+            active_ver = target_ver
+        status = "missing"
+        if on_disk:
+            status = "outdated" if active_ver and target_ver and active_ver != target_ver else "installed"
+        result.append({
+            **entry,
+            "status": status,
+            "active_version": active_ver,
+        })
+    return result
+
+
+def _find_entry(entries, name):
+    if not name:
+        return None
+    for entry in entries:
+        if entry.get("name", "").strip().lower() == name.strip().lower():
+            return entry
+    return None
+
+
+def _find_first_entry_by_type(entries, entry_type):
+    wanted = str(entry_type or "").strip().lower()
+    for entry in entries or []:
+        if _entry_type(entry) == wanted:
+            return entry
+    return None
+
+
+def _selected_model_name_for_type(state, entry_type, kind=""):
+    selected_models = state.get("selected_models", {}) if isinstance(state, dict) else {}
+    if isinstance(selected_models, dict):
+        name = selected_models.get(f"{kind}:{entry_type}") if kind else None
+        name = name or selected_models.get(entry_type)
+        if name:
+            return name
+    return ""
+
+
+def _custom_context_model_entry(config, state):
+    models = config.get("models", []) if isinstance(config, dict) else []
+    active_kind = str(state.get("active_kind", "QI2") or "QI2").strip()
+    normalized_kind = _normalize_model_kind(active_kind)
+    context_type = "unet"
+    name = _selected_model_name_for_type(state, context_type, active_kind) or state.get("selected_model", "")
+    selected = _find_entry(models, name)
+    if selected and _entry_type(selected) == context_type and (not normalized_kind or _entry_kind(selected) == normalized_kind):
+        return selected
+    if normalized_kind in {"", "qi2"}:
+        preferred = _find_entry(models, DEFAULT_QI2_MODEL)
+        if preferred and _entry_type(preferred) == "unet" and _entry_kind(preferred) == "qi2":
+            return preferred
+    matched = next(
+        (
+            entry for entry in models
+            if _entry_type(entry) == context_type
+            and (not normalized_kind or _entry_kind(entry) == normalized_kind)
+        ),
+        None,
+    )
+    if matched:
+        return matched
+    if normalized_kind:
+        return {
+            "name": f"Custom {active_kind}",
+            "type": "custom",
+            "kind": active_kind,
+            "custom": True,
+        }
+    return _find_first_entry_by_type(models, context_type)
+
+
+def _rel_within_folder(local_path):
+    parts = local_path.replace("\\", "/").split("/")
+    if len(parts) >= 3 and parts[0] == "models":
+        return "/".join(parts[2:])
+    return parts[-1]
+
+
+def _find_model_on_disk(local_path):
+    if not isinstance(local_path, str) or not local_path:
+        return "", False
+    if is_absolute_path_any_os(local_path) or any(
+        part in {".", ".."} or "\0" in part for part in local_path.replace("\\", "/").split("/")
+    ):
+        return "", False
+    try:
+        _validate_model_filename(local_path)
+    except ValueError:
+        return "", False
+
+    parts = local_path.replace("\\", "/").split("/")
+    if len(parts) >= 3 and parts[0] == "models":
+        folder_type = parts[1]
+        rel_within = "/".join(parts[2:])
+    elif len(parts) >= 2:
+        folder_type = parts[-2]
+        rel_within = parts[-1]
+    else:
+        folder_type = ""
+        rel_within = local_path
+
+    filename = parts[-1]
+    keys = _FOLDER_MAP.get(folder_type, [folder_type] if folder_type else [])
+
+    for key in keys:
+        searches = [rel_within, filename] if rel_within != filename else [filename]
+        for search in searches:
+            found = get_full_path_agnostic(folder_paths, key, search, require_exists=True)
+            if found and os.path.isfile(found):
+                return found, True
+
+    try:
+        fallback = _resolve_model_download_path(local_path)
+    except ValueError:
+        return "", False
+    return fallback, os.path.isfile(fallback)
+
+
+def _entry_family_stem(local_path):
+    stem = os.path.splitext(os.path.basename(str(local_path or "").replace("\\", "/")))[0]
+    stem = re.sub(r"[-_](?:RC|V)?\d+(?:[._]\d+)*$", "", stem, flags=re.IGNORECASE)
+    stem = re.sub(r"[-_]V\d+[-_]\d+$", "", stem, flags=re.IGNORECASE)
+    return stem.lower()
+
+
+def _active_version_hints(version):
+    parts = [part for part in re.split(r"[^0-9]+", str(version or "")) if part]
+    if len(parts) > 1 and int(parts[0]) == 0:
+        parts = parts[1:]
+    if not parts:
+        return []
+    dotted = ".".join(parts)
+    underscored = "_".join(parts)
+    compact = "".join(parts)
+    return [dotted, underscored, compact]
+
+
+def _find_active_installed_local_path(entry, active_version):
+    local_path = str(entry.get("local_path", "") or "").replace("\\", "/")
+    if not local_path or not active_version:
+        return ""
+    try:
+        target = _resolve_model_download_path(local_path)
+    except ValueError:
+        return ""
+
+    folder = os.path.dirname(target)
+    if not os.path.isdir(folder):
+        return ""
+
+    family = _entry_family_stem(local_path)
+    ext = os.path.splitext(local_path)[1].lower()
+    hints = [hint.lower() for hint in _active_version_hints(active_version)]
+    matches = []
+    for filename in os.listdir(folder):
+        if ext and os.path.splitext(filename)[1].lower() != ext:
+            continue
+        candidate_family = _entry_family_stem(filename)
+        if candidate_family != family:
+            continue
+        normalized = os.path.splitext(filename)[0].lower().replace("_", ".").replace("-", ".")
+        if hints and not any(hint in normalized or hint.replace(".", "") in normalized.replace(".", "") for hint in hints):
+            continue
+        matches.append(filename)
+
+    if not matches:
+        return ""
+    matches.sort(key=lambda name: (_version_sort_key(name), name))
+    parts = local_path.split("/")[:-1] + [matches[-1]]
+    return "/".join(parts)
+
+
+def _apply_active_installed_paths(config):
+    installed = get_installed_version_info()
+    if not installed:
+        return config
+
+    result = dict(config)
+    for category in ("models", "clip", "vae", "lora", "controlnet", "other"):
+        updated = []
+        for entry in config.get(category, []) or []:
+            if not isinstance(entry, dict):
+                updated.append(entry)
+                continue
+            key = f"cc_{category}_{entry.get('name', '')}"
+            active_version = installed.get(key)
+            if active_version and active_version != entry.get("version"):
+                active_path = _find_active_installed_local_path(entry, active_version)
+                if active_path:
+                    entry = {**entry, "local_path": active_path, "version": active_version}
+            updated.append(entry)
+        result[category] = updated
+    return result
+
+
+def _normalize_meta_value(value):
+    return str(value or "").strip().lower()
+
+
+def _normalize_model_kind(value):
+    normalized = _normalize_meta_value(value)
+    compact = "".join(char for char in normalized if char.isalnum())
+    if compact in {"h3", "minimaxh3"}:
+        return "minimaxh3"
+    return normalized
+
+
+def _entry_kind(entry):
+    return _normalize_model_kind((entry or {}).get("kind") or (entry or {}).get("Kind"))
+
+
+def _entry_type(entry):
+    return _normalize_meta_value((entry or {}).get("type") or (entry or {}).get("Type"))
+
+
+def _lora_matches_model_kind(lora_entry, model_entry):
+    if not lora_entry or not model_entry:
+        return True
+    lora_kind = _entry_kind(lora_entry)
+    model_kind = _entry_kind(model_entry)
+    return not lora_kind or not model_kind or lora_kind == model_kind
+
+
+def _is_qwen_model_entry(model_entry):
+    identity = " ".join([
+        str(_entry_kind(model_entry)),
+        str((model_entry or {}).get("name", "")),
+        str((model_entry or {}).get("local_path", "")),
+    ]).lower()
+    return "qwen" in identity or "qi2" in identity
+
+
+def is_qi2_turbo_model(model_name):
+    return basename_agnostic(str(model_name or "")) == QI2_TURBO_MODEL_NAME
+
+
+def _is_turbo_preset(model_params, model_entry=None):
+    try:
+        steps = int((model_params or {}).get("steps") or DEFAULT_MODEL_STEPS)
+        cfg = float((model_params or {}).get("cfg") if (model_params or {}).get("cfg") is not None else DEFAULT_MODEL_CFG)
+    except (TypeError, ValueError):
+        return False
+    expected_steps = 6 if _entry_kind(model_entry) == "qi2" else 4
+    return steps == expected_steps and abs(cfg - 1.0) < 1e-6
+
+
+def _ensure_required_turbo_lora_state(loras, config, model_entry, model_params):
+    loras = list(loras or [])
+    if not _is_qwen_model_entry(model_entry) or not _is_turbo_preset(model_params, model_entry):
+        return loras
+
+    turbo_entries = [
+        entry for entry in config.get("lora", [])
+        if _entry_type(entry) == "turbolora" and _lora_matches_model_kind(entry, model_entry)
+    ]
+    if not turbo_entries:
+        return loras
+
+    turbo_names = {entry.get("name") for entry in turbo_entries if entry.get("name")}
+    if any(item.get("name") in turbo_names and item.get("auto_apply", False) for item in loras):
+        return loras
+
+    target = next(
+        (
+            entry for entry in turbo_entries
+            if "lightning" in f"{entry.get('name', '')} {entry.get('local_path', '')}".lower()
+        ),
+        turbo_entries[0],
+    )
+    target_name = target.get("name")
+    if not target_name:
+        return loras
+
+    existing_by_name = {item.get("name"): item for item in loras if item.get("name")}
+    for name in turbo_names:
+        item = existing_by_name.get(name)
+        if item is not None:
+            item["auto_apply"] = name == target_name
+            item["strength"] = 1.0
+        else:
+            loras.append({"name": name, "auto_apply": name == target_name, "strength": 1.0})
+    return loras
+
+
+def _filter_entries_by_kind(entries, kind):
+    normalized_kind = _normalize_model_kind(kind)
+    entries = list(entries or [])
+    if not normalized_kind:
+        return entries
+    matched = [entry for entry in entries if _entry_kind(entry) == normalized_kind]
+    if matched:
+        return matched
+    generic = [entry for entry in entries if not _entry_kind(entry)]
+    if generic:
+        return generic
+    available = sorted({_entry_kind(entry) for entry in entries if _entry_kind(entry)})
+    available_text = ", ".join(available) if available else "none"
+    raise RuntimeError(
+        f"[VNCCS Control Center] No assets compatible with model kind '{normalized_kind}'. "
+        f"Available asset kinds: {available_text}."
+    )
+
+
+def _is_audio_vae_entry(entry):
+    entry = entry or {}
+    role = _normalize_meta_value(entry.get("vae_role") or entry.get("role"))
+    entry_type = _entry_type(entry).replace("_", "").replace("-", "")
+    identity = " ".join([
+        str(entry.get("name", "")),
+        str(entry.get("local_path", "")),
+    ]).lower()
+    return role == "audio" or entry_type == "audiovae" or "audio_vae" in identity or "audio vae" in identity
+
+
+def _model_file_signature(full_path):
+    try:
+        stat = os.stat(full_path)
+    except OSError:
+        return None
+    return os.path.realpath(full_path), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
+def _cached_model_asset(slot, paths, options, load):
+    signatures = tuple(_model_file_signature(path) for path in paths)
+    if not all(signatures):
+        return load()  # Let the loader report missing or inaccessible files.
+    key = signatures, options
+    # ponytail: one active asset per slot; add a bounded LRU if switching models needs reuse.
+    with _MODEL_ASSET_LOCK:
+        cached = _MODEL_ASSET_CACHE.get(slot)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        _MODEL_ASSET_CACHE.pop(slot, None)
+        asset = load()
+        _MODEL_ASSET_CACHE[slot] = key, asset
+        return asset
+
+
+@lru_cache(maxsize=4)
+def _cached_lora_file(full_path, signature):
+    return comfy.utils.load_torch_file(full_path, safe_load=True, return_metadata=True)
+
+
+def _load_lora_file(full_path):
+    signature = _model_file_signature(full_path)
+    if signature is None:
+        return comfy.utils.load_torch_file(full_path, safe_load=True, return_metadata=True)
+    with _MODEL_ASSET_LOCK:
+        return _cached_lora_file(full_path, signature)
+
+
+def _load_checkpoint(full_path):
+    embeddings = folder_paths.get_folder_paths("embeddings")
+    output = _cached_model_asset("model", (full_path,), ("checkpoint", tuple(embeddings)), lambda:
+        comfy.sd.load_checkpoint_guess_config(
+            full_path, output_vae=True, output_clip=True, embedding_directory=embeddings,
+        )
+    )
+    return output[0], output[1], output[2]
+
+
+def _load_unet(full_path, settings=None):
+    import torch
+
+    model_options = {}
+    weight_dtype = (settings or {}).get("weight_dtype", "default")
+    if weight_dtype == "fp8_e4m3fn":
+        model_options["dtype"] = torch.float8_e4m3fn
+    elif weight_dtype == "fp8_e4m3fn_fast":
+        model_options["dtype"] = torch.float8_e4m3fn
+        model_options["fp8_optimizations"] = True
+    elif weight_dtype == "fp8_e5m2":
+        model_options["dtype"] = torch.float8_e5m2
+    return _cached_model_asset("model", (full_path,), ("unet", weight_dtype), lambda:
+        comfy.sd.load_diffusion_model(full_path, model_options=model_options)
+    )
+
+
+def _load_gguf(full_path):
+    loader_cls = _get_gguf_loader_class()
+    if loader_cls is None:
+        raise RuntimeError(
+            "[VNCCS Control Center] ComfyUI-GGUF not found. Install github.com/city96/ComfyUI-GGUF"
+        )
+
+    loader_info = _describe_gguf_loader(loader_cls)
+    if loader_info.get("warning"):
+        log_event("warning", component="ControlCenter", level="warning", message=f"Warning: {loader_info['warning']} Active loader: {loader_info.get('folder') or loader_info.get('module') or loader_info.get('file') or 'unknown'}")
+
+    def load():
+        loader = loader_cls()
+        unet_name = basename_agnostic(full_path)
+        for folder_type in _FOLDER_MAP["gguf"]:
+            try:
+                roots = folder_paths.get_folder_paths(folder_type) or []
+            except Exception:
+                continue
+            for root in roots:
+                try:
+                    relative = os.path.relpath(os.path.realpath(full_path), os.path.realpath(root))
+                except ValueError:
+                    continue
+                if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+                    continue
+                unet_name = relative
+                break
+            else:
+                continue
+            break
+        try:
+            model, = loader.load_unet(unet_name)
+        except ValueError as exc:
+            message = str(exc)
+            if "Unexpected architecture type" in message and "qwen_image" in message:
+                active_loader = loader_info.get("folder") or loader_info.get("module") or loader_info.get("file") or "unknown"
+                raise RuntimeError(
+                    "[VNCCS Control Center] Installed GGUF loader does not support Qwen Image GGUF files. "
+                    "Update github.com/city96/ComfyUI-GGUF and remove or disable older GGUF forks. "
+                    f"Active loader: {active_loader}."
+                ) from exc
+            raise
+        return model
+    return _cached_model_asset("model", (full_path,), ("gguf", loader_cls), load)
+
+
+def _load_clips(clip_entries, selected_names):
+    log_stage("loading_text_encoder", count=len(selected_names or []))
+    if not selected_names:
+        raise RuntimeError("[VNCCS Control Center] No CLIP selected.")
+
+    paths = []
+    clip_type_str = "stable_diffusion"
+    for name in selected_names:
+        entry = _find_entry(clip_entries, name)
+        if not entry:
+            raise RuntimeError(f"[VNCCS Control Center] CLIP entry not found: '{name}'")
+        full_path, exists = _find_model_on_disk(entry["local_path"])
+        if not exists:
+            raise RuntimeError(f"[VNCCS Control Center] CLIP not downloaded: '{name}'")
+        paths.append(full_path)
+        clip_type_str = entry.get("clip_type", clip_type_str)
+
+    clip_type = getattr(
+        comfy.sd.CLIPType,
+        clip_type_str.upper(),
+        comfy.sd.CLIPType.STABLE_DIFFUSION,
+    )
+    embeddings = folder_paths.get_folder_paths("embeddings")
+    return _cached_model_asset("clip", paths, (clip_type, tuple(embeddings)), lambda:
+        comfy.sd.load_clip(ckpt_paths=paths, embedding_directory=embeddings, clip_type=clip_type)
+    )
+
+
+def _load_vae(vae_entries, selected_name):
+    log_stage("loading_vae", model=selected_name)
+    if not selected_name:
+        raise RuntimeError("[VNCCS Control Center] No VAE selected.")
+    entry = _find_entry(vae_entries, selected_name)
+    if not entry:
+        raise RuntimeError(f"[VNCCS Control Center] VAE entry not found: '{selected_name}'")
+    full_path, exists = _find_model_on_disk(entry["local_path"])
+    if not exists:
+        raise RuntimeError(f"[VNCCS Control Center] VAE not downloaded: '{selected_name}'")
+    def load():
+        sd, metadata = comfy.utils.load_torch_file(full_path, return_metadata=True)
+        return comfy.sd.VAE(sd=sd, metadata=metadata)
+    slot = "audio_vae" if _is_audio_vae_entry(entry) else "vae"
+    return _cached_model_asset(slot, (full_path,), (), load)
+
+
+def _load_model_block(
+    model_entry,
+    selected_type,
+    type_settings,
+    config,
+    selected_clips,
+    selected_vae,
+    custom_model=None,
+    custom_clip=None,
+    custom_vae=None,
+):
+    log_stage("loading_models", loader=selected_type, model=model_entry.get("name") if model_entry else None)
+    if selected_type == "custom":
+        if custom_model is None:
+            raise RuntimeError("[VNCCS Control Center] Custom model input is not connected.")
+        if custom_clip is None:
+            raise RuntimeError("[VNCCS Control Center] Custom CLIP input is not connected.")
+        if custom_vae is None:
+            raise RuntimeError("[VNCCS Control Center] Custom VAE input is not connected.")
+        return custom_model, custom_clip, custom_vae
+
+    if not model_entry:
+        raise RuntimeError("[VNCCS Control Center] No model selected.")
+
+    full_path, exists = _find_model_on_disk(model_entry["local_path"])
+    if not exists:
+        raise RuntimeError(
+            f"[VNCCS Control Center] Model not downloaded: '{model_entry['name']}'."
+        )
+
+    model_type = selected_type or model_entry.get("type", "")
+    if model_type == "checkpoint":
+        return _load_checkpoint(full_path)
+    if model_type == "unet":
+        model = _load_unet(full_path, type_settings.get("unet", {}))
+    elif model_type == "gguf":
+        model = _load_gguf(full_path)
+    elif model_type == "nunchaku":
+        # TECH DEBT: legacy Nunchaku branch disabled. Delete this branch later.
+        raise RuntimeError(f"[VNCCS Control Center] {NUNCHAKU_DISABLED_MESSAGE}")
+    else:
+        raise RuntimeError(f"[VNCCS Control Center] Unknown model type: '{model_type}'")
+
+    clip = _load_clips(config.get("clip", []), selected_clips)
+    vae = _load_vae(config.get("vae", []), selected_vae)
+    return model, clip, vae
+
+
+def _apply_lora_standard(model, clip, full_path, strength):
+    lora_name = basename_agnostic(full_path)
+    try:
+        _validate_downloaded_model_file(full_path, lora_name)
+        lora_sd, _metadata = _load_lora_file(full_path)
+    except Exception as exc:
+        raise RuntimeError(
+            "[VNCCS Control Center] Failed to load LoRA "
+            f"'{lora_name}'. The file appears to be invalid or incomplete; "
+            "delete it and download/copy the LoRA again."
+        ) from exc
+    clip_strength = strength if clip is not None else 0.0
+    return comfy.sd.load_lora_for_models(model, clip, lora_sd, strength, clip_strength)
+
+
+def _apply_loras(model, clip, lora_states, config, model_type, type_settings=None, model_entry=None):
+    entries = config.get("lora", [])
+    is_nunchaku = False
+    if model_type == "nunchaku":
+        # TECH DEBT: legacy Nunchaku LoRA path disabled. Delete later.
+        raise RuntimeError(f"[VNCCS Control Center] {NUNCHAKU_DISABLED_MESSAGE}")
+    state_by_name = {item["name"]: item for item in (lora_states or []) if item.get("name")}
+
+    for entry in entries:
+        name = entry.get("name", "")
+        if not name:
+            continue
+        lora_type = _entry_type(entry)
+        is_custom = bool(entry.get("custom"))
+        is_turbo = lora_type == "turbolora"
+
+        if not is_custom and not is_turbo:
+            continue
+        custom_kind = _entry_kind(entry)
+        if is_custom and custom_kind not in {"", "custom"} and not _lora_matches_model_kind(entry, model_entry):
+            continue
+        if not is_custom and not _lora_matches_model_kind(entry, model_entry):
+            continue
+
+        identity = f"{name} {basename_agnostic(entry.get('local_path', ''))}".lower()
+        normalized_name = "".join(char for char in identity if char.isalnum())
+        if any("".join(char for char in target if char.isalnum()) in normalized_name for target in _PIPELINE_LOCAL_LORAS):
+            log_event("lora_deferred", component="ControlCenter", model=name)
+            continue
+        state = state_by_name.get(name, {})
+        if not state.get("auto_apply", False):
+            continue
+        strength = 1.0 if is_turbo else float(state.get("strength", 1.0))
+        if abs(strength) < 1e-6:
+            continue
+
+        full_path, exists = _find_model_on_disk(entry["local_path"])
+        if not exists:
+            raise FileNotFoundError(
+                f"Enabled LoRA '{name}' is not installed. Restore it or disable it before generating."
+            )
+
+        log_event("lora_applied", component="ControlCenter", model=name, strength=strength)
+        model, clip = _apply_lora_standard(model, clip, full_path, strength)
+
+    return model, clip
+
+
+def _download_with_progress(model_key, repo_id, filename, revision=None):
+    """Use Hub's HTTP download path for regular, measured byte progress."""
+    from huggingface_hub import file_download
+
+    supports_progress = "tqdm_class" in inspect.signature(hf_hub_download).parameters
+    had_file_download_tqdm = hasattr(file_download, "tqdm")
+    original_tqdm = getattr(file_download, "tqdm", None)
+    if original_tqdm is None:
+        try:
+            from huggingface_hub.utils import tqdm as original_tqdm
+        except ImportError:
+            try:
+                from tqdm.auto import tqdm as original_tqdm
+            except ImportError:
+                class original_tqdm:
+                    """Minimal tqdm-compatible base for modern Hub installs."""
+
+                    def __init__(self, *args, total=None, initial=0, disable=None, **kwargs):
+                        self.total = total
+                        self.n = initial
+                        self.disable = disable is not False
+
+                    def update(self, n=1):
+                        if not self.disable:
+                            self.n += n
+
+                    def close(self):
+                        pass
+
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *args):
+                        self.close()
+    original_context = getattr(file_download, "_get_progress_bar_context", None)
+    original_constants = file_download.constants
+    original_xet_available = getattr(file_download, "is_xet_available", None)
+    owner_thread = threading.get_ident()
+    primary_bar = None
+    active = True
+
+    class DownloadConstants:
+        def __getattr__(self, name):
+            if active and threading.get_ident() == owner_thread:
+                if name == "HF_HUB_DISABLE_XET":
+                    return True
+                if name == "HF_HUB_ENABLE_HF_TRANSFER":
+                    return False
+                if name == "DOWNLOAD_CHUNK_SIZE":
+                    return 1024 * 1024
+            return getattr(original_constants, name)
+
+    download_constants = DownloadConstants()
+
+    def xet_available():
+        if active and threading.get_ident() == owner_thread:
+            return False
+        return original_xet_available()
+
+    class DownloadProgress(original_tqdm):
+        def __init__(self, *args, **kwargs):
+            nonlocal primary_bar
+            super().__init__(*args, **kwargs)
+            # Xet can create a second bar for compressed network traffic. Report
+            # only the first byte bar, which tracks the reconstructed model.
+            self._report_download = (
+                threading.get_ident() == owner_thread
+                and kwargs.get("unit") == "B"
+                and primary_bar is None
+            )
+            if self._report_download:
+                primary_bar = self
+                self._publish_download()
+
+        def _publish_download(self):
+            if not active or not self._report_download:
+                return
+            done = max(0, self.n)
+            total = self.total
+            message = f"Downloading: {done / (1024 * 1024):.1f} MB"
+            status = {"status": "downloading", "message": message}
+            if total is not None and total > 0:
+                progress = min(100, done / total * 100)
+                status.update(
+                    message=f"Downloading: {progress:.0f}% · {done / (1024 * 1024):.1f}/{total / (1024 * 1024):.1f} MB",
+                    progress=progress,
+                )
+            _DOWNLOAD_STATUS[model_key] = status
+
+        def update(self, n=1):
+            # Disabled terminal bars skip tqdm's counter, but GUI reporting must
+            # still work in ComfyUI Desktop and when console progress is hidden.
+            if self._report_download and self.disable:
+                self.n += n
+            result = super().update(n)
+            self._publish_download()
+            return result
+
+        def close(self):
+            nonlocal primary_bar
+            try:
+                super().close()
+            finally:
+                if primary_bar is self:
+                    primary_bar = None
+
+    def progress_context(**kwargs):
+        if threading.get_ident() != owner_thread or kwargs.get("_tqdm_bar") is not None:
+            return original_context(**kwargs)
+        # Later 0.x releases construct both HTTP and Xet bars in this helper.
+        options = dict(kwargs)
+        options.pop("_tqdm_bar", None)
+        log_level = options.pop("log_level", None)
+        options.setdefault("unit", "B")
+        options.setdefault("unit_scale", True)
+        options["disable"] = True if log_level == 0 else None
+        return DownloadProgress(**options)
+
+    try:
+        # Older Xet callbacks count buffered reconstruction, leaving the UI
+        # unchanged during network transfer. Keep Hub's cache, resume and
+        # validation, but use its HTTP stream in this worker only. Other Hub
+        # users retain their transport and chunk size, even on other threads.
+        file_download.constants = download_constants
+        if original_xet_available is not None:
+            file_download.is_xet_available = xet_available
+        if supports_progress:
+            return hf_hub_download(
+                repo_id=repo_id, filename=filename, revision=revision,
+                token=False, tqdm_class=DownloadProgress,
+            )
+        # Hub 0.x has no per-call progress parameter. Scope its adapter to this
+        # worker call; bars constructed by other threads never publish here.
+        file_download.tqdm = DownloadProgress
+        if original_context is not None:
+            file_download._get_progress_bar_context = progress_context
+        return hf_hub_download(repo_id=repo_id, filename=filename, revision=revision, token=False)
+    finally:
+        active = False
+        if file_download.constants is download_constants:
+            file_download.constants = original_constants
+        if original_xet_available is not None and file_download.is_xet_available is xet_available:
+            file_download.is_xet_available = original_xet_available
+        if not supports_progress and getattr(file_download, "tqdm", None) is DownloadProgress:
+            if had_file_download_tqdm:
+                file_download.tqdm = original_tqdm
+            else:
+                delattr(file_download, "tqdm")
+        if not supports_progress and original_context is not None:
+            if file_download._get_progress_bar_context is progress_context:
+                file_download._get_progress_bar_context = original_context
+
+
+def _download_worker_loop():
+    while True:
+        task = _DOWNLOAD_QUEUE.get()
+        if task is None:
+            break
+
+        repo_id, model_key, target_model = task
+        download_repo_id = target_model.get("hf_repo", repo_id)
+        temp_path = ""
+        download_started = time.perf_counter()
+
+        try:
+            _DOWNLOAD_STATUS[model_key] = {"status": "downloading", "message": "Initializing..."}
+            log_event("download_started", component="ControlCenter", model=model_key, repository=download_repo_id)
+            target_abs_path = _resolve_model_download_path(target_model["local_path"])
+            if target_model.get("url"):
+                raise ValueError("Direct URL downloads are disabled; use hf_repo and hf_path")
+
+            filename = target_model["hf_path"]
+            if filename.startswith(f"{download_repo_id}/"):
+                filename = filename[len(download_repo_id) + 1:]
+            _validate_model_filename(filename)
+            cached_path = _download_with_progress(
+                model_key,
+                repo_id=download_repo_id,
+                filename=filename,
+                revision=target_model.get("revision") or None,
+            )
+
+            expected_name = basename_agnostic(target_model.get("local_path", "") or target_model.get("hf_path", "") or "model")
+            total_size = os.path.getsize(cached_path)
+            max_bytes = _max_download_bytes()
+            if total_size > max_bytes:
+                raise ValueError(
+                    f"{expected_name} is too large to install safely "
+                    f"({total_size / (1024 * 1024 * 1024):.1f} GB, limit {max_bytes / (1024 * 1024 * 1024):.1f} GB)"
+                )
+            downloaded = 0
+            temp_fd, temp_path = _create_download_staging_file(target_abs_path, model_key)
+
+            with open(cached_path, "rb") as source, os.fdopen(temp_fd, "wb") as handle:
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                    downloaded += len(chunk)
+                    if downloaded > max_bytes:
+                        raise ValueError(f"{expected_name} exceeded max download size")
+                    mb_done = downloaded / (1024 * 1024)
+                    if total_size > 0:
+                        mb_total = total_size / (1024 * 1024)
+                        _DOWNLOAD_STATUS[model_key] = {
+                            "status": "downloading",
+                            "message": f"Installing: {mb_done:.1f}/{mb_total:.1f} MB",
+                            "progress": (downloaded / total_size) * 100,
+                        }
+
+            _DOWNLOAD_STATUS[model_key]["message"] = "Validating..."
+            _validate_downloaded_model_file(temp_path, os.path.basename(target_abs_path))
+            _DOWNLOAD_STATUS[model_key]["message"] = "Installing..."
+            os.replace(temp_path, target_abs_path)
+            update_installed_version(model_key, target_model.get("version", ""))
+            _DOWNLOAD_STATUS[model_key] = {"status": "success", "message": "Installed"}
+            log_event("download_completed", component="ControlCenter", model=model_key, bytes=total_size,
+                      duration_s=round(time.perf_counter() - download_started, 2))
+        except Exception as exc:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception as cleanup_exc:
+                    log_event('warning', component='ControlCenter', level='warning', message=f"Failed to remove temp download '{temp_path}': {cleanup_exc}", error=str(cleanup_exc))
+            response = getattr(exc, "response", None)
+            is_auth_error = getattr(response, "status_code", None) == 401
+
+            message = str(exc)
+            status = "error"
+            if is_auth_error:
+                message = "Authentication required; token-based downloads are disabled"
+            elif "404" in message or "EntryNotFoundError" in message:
+                message = "File not found (404)"
+
+            _DOWNLOAD_STATUS[model_key] = {"status": status, "message": message}
+            log_event("download_failed", component="ControlCenter", level="error", model=model_key,
+                      error=message, duration_s=round(time.perf_counter() - download_started, 2))
+        finally:
+            _DOWNLOAD_QUEUE.task_done()
+
+
+threading.Thread(target=_download_worker_loop, daemon=True).start()
+
+
+class VNCCSPipeProxy:
+    def __init__(self, model, clip, vae, audio_vae=None):
+        self.model = model
+        self.clip = clip
+        self.vae = vae
+        self.audio_vae = audio_vae
+        self.pos = None
+        self.neg = None
+        self.seed_int = 0
+        self.sample_steps = DEFAULT_MODEL_STEPS
+        self.cfg = DEFAULT_MODEL_CFG
+        self.denoise = 0.0
+        self.sampler_name = None
+        self.scheduler = None
+        self.loader_type = None        # "standard" | "nunchaku"
+        self.nunchaku_kind = None      # "flux" | "qwen-image" | None
+        self.nunchaku_settings = None  # dict or None
+        self.model_entry = None        # config model entry dict or None
+        self.model_kind = ""           # stable family identity, including custom models
+        self.qi2_cache = dict(QI2_CACHE_DEFAULTS)
+        self.repo_id = None            # source Control Center repo id
+        self.lora_entries = []         # config lora entries
+        self.lora_states = []          # UI lora state
+
+
+_CUSTOM_PREVIEW_PIPES = WeakValueDictionary()
+
+
+def _parse_control_center_state(node_state):
+    state = json.loads(node_state or "{}") if isinstance(node_state, str) else node_state
+    if not isinstance(state, dict):
+        raise ValueError("State must be an object")
+    for key in ("selected_models", "selected_types_by_kind", "model_params", "model_params_by_kind", "type_settings", "qi2_cache", "collapsed"):
+        if key in state and not isinstance(state[key], dict):
+            raise ValueError(f"{key} must be an object")
+    for key in ("model_params_by_kind", "type_settings"):
+        if any(not isinstance(value, dict) for value in state.get(key, {}).values()):
+            raise ValueError(f"{key} entries must be objects")
+    for key in ("selected_models", "selected_types_by_kind"):
+        if any(not isinstance(value, str) for value in state.get(key, {}).values()):
+            raise ValueError(f"{key} entries must be strings")
+    for key in ("active_kind", "selected_type", "selected_model", "unsupported_model_kind"):
+        if key in state and not isinstance(state[key], str):
+            raise ValueError(f"{key} must be a string")
+    if "loras" in state and (not isinstance(state["loras"], list) or any(
+            not isinstance(item, dict) or ("name" in item and not isinstance(item["name"], str))
+            for item in state["loras"])):
+        raise ValueError("LoRA states must be objects in an array")
+    numeric_values = []
+    for params in [state.get("model_params", {}), *state.get("model_params_by_kind", {}).values()]:
+        for field, convert in (("steps", int), ("cfg", float)):
+            value = params.get(field)
+            if value is not None and not (field == "steps" and value == ""):
+                numeric_values.append((value, convert, field))
+        for field in ("sampler", "scheduler"):
+            if params.get(field) is not None and not isinstance(params[field], str):
+                raise ValueError(f"{field} must be a string")
+    for field in ("device", "dtype"):
+        if state.get("qi2_cache", {}).get(field) is not None and not isinstance(state["qi2_cache"][field], str):
+            raise ValueError(f"qi2_cache.{field} must be a string")
+    for item in state.get("loras", []):
+        if "strength" in item:
+            numeric_values.append((item["strength"], float, "LoRA strength"))
+    for value, convert, field in numeric_values:
+        try:
+            if not math.isfinite(convert(value)):
+                raise ValueError("Non-finite number")
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{field} must be a finite number") from exc
+    return state
+
+
+def _preview_state_key(repo_id, node_state):
+    state = _parse_control_center_state(node_state)
+    state = {key: value for key, value in state.items() if key != "preview_scope"}
+    return str(repo_id), json.dumps(state, sort_keys=True, separators=(",", ":"))
+
+
+class VNCCS_ControlCenter:
+    @classmethod
+    def IS_CHANGED(cls, repo_id, **kwargs):
+        config = _apply_active_installed_paths(_get_cc_config(repo_id))
+        files = [_model_file_signature(_find_model_on_disk(entry.get("local_path", ""))[0])
+                 for category in ("models", "clip", "vae", "lora")
+                 for entry in config.get(category, [])]
+        return json.dumps([config, files], sort_keys=True)
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "repo_id": ("STRING", {"default": "MIUProject/VNCCS_v3.0", "multiline": False}),
+                "node_state": ("STRING", {"default": "{}"}),
+            },
+            "optional": {
+                "model": ("MODEL",),
+                "clip": ("CLIP",),
+                "vae": ("VAE",),
+                "audio_vae": ("VAE",),
+            },
+            "hidden": {"unique_id": "UNIQUE_ID"},
+        }
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, input_types):
+        return True
+
+    RETURN_TYPES = ("VNCCS_PIPE",)
+    RETURN_NAMES = ("pipe",)
+    FUNCTION = "execute"
+    CATEGORY = "VNCCS/manager"
+
+    @logged_operation("ControlCenter", "load_pipeline")
+    def execute(self, repo_id, node_state="{}", model=None, clip=None, vae=None, audio_vae=None, unique_id=None):
+        pipe = _build_control_center_pipe(
+            repo_id,
+            node_state,
+            custom_model=model,
+            custom_clip=clip,
+            custom_vae=vae,
+            custom_audio_vae=audio_vae,
+        )
+        if unique_id is not None:
+            scope = _parse_control_center_state(node_state).get("preview_scope")
+            if _valid_scope(scope):
+                key = (scope, str(unique_id))
+                _CUSTOM_PREVIEW_PIPES.pop(key, None)
+                if model is not None and clip is not None and vae is not None:
+                    pipe.preview_state_key = _preview_state_key(repo_id, node_state)
+                    _CUSTOM_PREVIEW_PIPES[key] = pipe
+        return (pipe,)
+
+
+@inference_stage()
+def _build_control_center_pipe(
+    repo_id,
+    node_state,
+    custom_model=None,
+    custom_clip=None,
+    custom_vae=None,
+    custom_audio_vae=None,
+):
+    try:
+        state = _parse_control_center_state(node_state)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("[VNCCS Control Center] Invalid node_state; repair the saved workflow before running.") from exc
+
+    active_kind = str(state.get("active_kind", "") or "").strip()
+    if active_kind.lower() == "qie2511" or state.get("unsupported_model_kind") == "QIE2511":
+        raise RuntimeError("[VNCCS Control Center] QIE2511 is no longer supported. Select a QI2 model in Control Center.")
+    if not active_kind and "qwen-image-edit-2511" in str(state.get("selected_model", "")).lower():
+        raise RuntimeError("[VNCCS Control Center] QIE2511 is no longer supported. Select a QI2 model in Control Center.")
+    selected_type = state.get("selected_type", "")
+    selected_types_by_kind = state.get("selected_types_by_kind", {})
+    if active_kind and isinstance(selected_types_by_kind, dict):
+        selected_type = selected_types_by_kind.get(active_kind, selected_type)
+    selected_model = state.get("selected_model", "")
+    selected_models = state.get("selected_models", {})
+    if active_kind and isinstance(selected_models, dict):
+        selected_model = selected_models.get(f"{active_kind}:{selected_type}", selected_model)
+    loras = [dict(item) for item in state.get("loras", [])]
+    for item in loras:
+        if "auto_apply" not in item and "enabled" in item:
+            item["auto_apply"] = item["enabled"] is not False
+    type_settings = state.get("type_settings", {})
+    model_params = state.get("model_params", {})
+    model_params_by_kind = state.get("model_params_by_kind", {})
+    if active_kind and isinstance(model_params_by_kind, dict):
+        model_params = model_params_by_kind.get(active_kind, model_params)
+
+    config = _apply_active_installed_paths(_get_cc_config(repo_id))
+    if selected_type == "custom":
+        model_entry = _custom_context_model_entry(config, state)
+    else:
+        model_entry = _find_entry(config.get("models", []), selected_model)
+        selection_kind = _normalize_model_kind(active_kind) or _entry_kind(model_entry)
+        if not selection_kind and model_entry is None:
+            selection_kind = "qi2"
+        if selection_kind == "qi2" and selected_type in {"", "gguf", "unet"}:
+            selected_type = "unet"
+            if not model_entry or _entry_type(model_entry) != "unet" or _entry_kind(model_entry) != "qi2":
+                candidates = [
+                    entry for entry in config.get("models", [])
+                    if _entry_kind(entry) == "qi2" and _entry_type(entry) == "unet"
+                ]
+                saved_unet = _selected_model_name_for_type(state, "unet", "QI2")
+                model_entry = (
+                    _find_entry(candidates, saved_unet)
+                    or _find_entry(candidates, DEFAULT_QI2_MODEL)
+                    or next(iter(candidates), None)
+                )
+            if model_entry is None:
+                raise RuntimeError(
+                    "[VNCCS Control Center] No native QI2 UNet model in the catalog. "
+                    "Refresh the Control Center catalog to load Qwen Image 2.1."
+                )
+    selected_type = selected_type or _entry_type(model_entry)
+    loras = _ensure_required_turbo_lora_state(loras, config, model_entry, model_params)
+    if selected_type == "nunchaku":
+        # TECH DEBT: old saved workflows may still request Nunchaku. Delete this
+        # guard together with all legacy Nunchaku state after migration.
+        raise RuntimeError(f"[VNCCS Control Center] {NUNCHAKU_DISABLED_MESSAGE}")
+
+    model_kind = _entry_kind(model_entry) or _normalize_model_kind(active_kind)
+    if model_kind == "minimaxh3":
+        require_h3_still_support()
+    if model_kind == "qie2511":
+        raise RuntimeError("[VNCCS Control Center] QIE2511 is no longer supported. Select a QI2 model.")
+    selected_audio_vae_name = ""
+    if selected_type in {"custom", "checkpoint"}:
+        all_clip_names = []
+        first_vae_name = ""
+        if selected_type == "custom" and model_kind == "minimaxh3" and custom_audio_vae is None:
+            raise RuntimeError("[VNCCS Control Center] Custom MiniMax H3 audio VAE input is not connected.")
+    else:
+        compatible_clips = _filter_entries_by_kind(config.get("clip", []), model_kind)
+        compatible_vaes = _filter_entries_by_kind(config.get("vae", []), model_kind)
+        all_clip_names = [entry["name"] for entry in compatible_clips]
+        if model_kind == "minimaxh3":
+            video_vaes = [entry for entry in compatible_vaes if not _is_audio_vae_entry(entry)]
+            audio_vaes = [entry for entry in compatible_vaes if _is_audio_vae_entry(entry)]
+            if not video_vaes or not audio_vaes:
+                raise RuntimeError(
+                    "[VNCCS Control Center] MiniMax H3 requires both video and audio VAE entries. "
+                    "Mark the audio entry with vae_role='audio', role='audio', or type='AudioVAE'."
+                )
+            first_vae_name = video_vaes[0]["name"]
+            selected_audio_vae_name = audio_vaes[0]["name"]
+        else:
+            first_vae_name = compatible_vaes[0]["name"] if compatible_vaes else ""
+    model, clip, vae = _load_model_block(
+        model_entry,
+        selected_type,
+        type_settings,
+        config,
+        all_clip_names,
+        first_vae_name,
+        custom_model=custom_model,
+        custom_clip=custom_clip,
+        custom_vae=custom_vae,
+    )
+    audio_vae = custom_audio_vae if selected_type == "custom" else None
+    if selected_audio_vae_name:
+        audio_vae = _load_vae(config.get("vae", []), selected_audio_vae_name)
+    if selected_type != "custom":
+        # Clone request-owned patches and CLIP options while sharing native weights.
+        model = model.clone() if hasattr(model, "clone") else model
+        clip = clip.clone() if hasattr(clip, "clone") else clip
+    model, clip = _apply_loras(
+        model,
+        clip,
+        loras,
+        config,
+        selected_type,
+        type_settings=type_settings,
+        model_entry=model_entry,
+    )
+
+    pipe = VNCCSPipeProxy(model, clip, vae, audio_vae=audio_vae)
+    pipe.repo_id = repo_id
+    pipe.lora_entries = list(config.get("lora", []) or [])
+    pipe.lora_states = list(loras or [])
+
+    pipe.loader_type = "standard"
+    # TECH DEBT: deprecated Nunchaku pipe fields kept as None for old node state
+    # compatibility. Delete these fields after old workflow JSON is migrated.
+    pipe.nunchaku_kind = None
+    pipe.nunchaku_settings = None
+    pipe.model_entry = model_entry
+    pipe.model_kind = model_kind
+    # Persist only catalog-backed identities. Custom input objects may change
+    # without changing their catalog context, so their previews must be regenerated.
+    pipe.model_cache_key = None if selected_type == "custom" else {
+        "model": model_entry,
+        "clips": [entry for entry in config.get("clip", []) if entry.get("name") in all_clip_names],
+        "vaes": [entry for entry in config.get("vae", []) if entry.get("name") in {first_vae_name, selected_audio_vae_name}],
+        "type_settings": type_settings,
+        "lora_entries": pipe.lora_entries,
+        "lora_states": pipe.lora_states,
+    }
+    if pipe.model_cache_key is not None:
+        pipe.model_cache_key["files"] = [
+            _model_file_signature(_find_model_on_disk(entry.get("local_path", ""))[0])
+            for entry in [model_entry, *pipe.model_cache_key["clips"],
+                          *pipe.model_cache_key["vaes"], *pipe.lora_entries]
+        ]
+    cache_settings = state.get("qi2_cache", {})
+    if not isinstance(cache_settings, dict):
+        cache_settings = {}
+    pipe.qi2_cache = {
+        "device": cache_settings.get("device") if cache_settings.get("device") in {"auto", "gpu", "cpu", "off"} else QI2_CACHE_DEFAULTS["device"],
+        "dtype": cache_settings.get("dtype") if cache_settings.get("dtype") in {"default", "int8", "int4"} else QI2_CACHE_DEFAULTS["dtype"],
+    }
+
+    default_steps = 8 if model_kind == "minimaxh3" else 25 if model_kind == "qi2" else DEFAULT_MODEL_STEPS
+    default_cfg = 3.0 if model_kind == "qi2" else DEFAULT_MODEL_CFG
+    if model_kind == "qi2" and is_qi2_turbo_model(model_entry.get("local_path")):
+        default_steps, default_cfg = 8, 1.0
+    default_sampler = "res_multistep" if model_kind == "minimaxh3" else None
+    pipe.sample_steps = int(model_params.get("steps") or default_steps)
+    pipe.cfg = float(model_params.get("cfg") if model_params.get("cfg") is not None else default_cfg)
+    pipe.sampler_name = model_params.get("sampler") or default_sampler
+    pipe.scheduler = model_params.get("scheduler") or DEFAULT_MODEL_SCHEDULER
+
+    return pipe
+
+
+@server.PromptServer.instance.routes.get("/vnccs/control_center/nunchaku_fix_status")
+async def cc_nunchaku_fix_status(request):
+    return web.json_response({
+        "installed": False,
+        "disabled": True,
+        "message": "Nunchaku auto-patch is disabled in VNCCS web API.",
+    })
+
+
+@server.PromptServer.instance.routes.post("/vnccs/control_center/nunchaku_apply_fix")
+async def cc_nunchaku_apply_fix(request):
+    return web.json_response({
+        "ok": False,
+        "disabled": True,
+        "message": "Nunchaku auto-patch is disabled. Apply upstream fixes manually if you use Nunchaku.",
+    }, status=410)
+
+
+@server.PromptServer.instance.routes.post("/vnccs/control_center/dependencies")
+async def cc_dependencies(request):
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    if not isinstance(data, dict) or any(not isinstance(data.get(field, ""), str)
+                                        for field in ("model_type", "model_name", "model_path")):
+        return web.json_response({"error": "Dependency identity fields must be strings in an object"}, status=400)
+
+    model_type = data.get("model_type", "")
+    model_name = data.get("model_name", "")
+    model_path = data.get("model_path", "")
+    has_enabled_loras = bool(data.get("has_enabled_loras", False))
+
+    if model_type != "nunchaku":
+        return web.json_response({"ok": True, "message": ""})
+
+    # TECH DEBT: legacy Nunchaku dependency API is kept only for old frontend
+    # code paths. Delete after stale workflows are migrated.
+    return web.json_response(_get_nunchaku_dependency_status(
+        model_entry={"name": model_name, "local_path": model_path},
+        full_path=model_path,
+        has_enabled_loras=has_enabled_loras,
+    ))
+
+
+def _clothes_preview_response(data):
+    if not isinstance(data, dict) or not isinstance(data.get("repo_id", ""), str):
+        return web.Response(status=400, text="Preview fields must be an object with a string repo_id")
+    if not isinstance(data.get("clothes_state", {}), dict):
+        return web.Response(status=400, text="clothes_state must be an object")
+    try:
+        state = _parse_control_center_state(data.get("node_state", "{}"))
+    except (TypeError, ValueError) as exc:
+        return web.Response(status=400, text=f"Invalid node_state: {exc}")
+    try:
+        repo_id = (data.get("repo_id") or "").strip()
+        node_state = data.get("node_state", "{}")
+        clothes_state = data.get("clothes_state", {})
+
+        if not repo_id:
+            return web.Response(status=400, text="Missing repo_id")
+
+        selected_type = (state.get("selected_types_by_kind") or {}).get(state.get("active_kind"), state.get("selected_type"))
+        if selected_type == "custom":
+            scope = data.get("control_center_scope")
+            pipe = _CUSTOM_PREVIEW_PIPES.get((scope, str(data.get("control_center_id", "")))) if _valid_scope(scope) else None
+            if pipe is None or pipe.preview_state_key != _preview_state_key(repo_id, node_state):
+                return web.Response(status=409, text=(
+                    "Custom model inputs for this Control Center configuration are not available in preview memory. "
+                    "Select a catalog model for standalone preview. The workflow has not been queued."
+                ))
+        else:
+            pipe = _build_control_center_pipe(repo_id, node_state)
+
+        from .clothes_designer import ClothesDesigner
+
+        widget_data_str = json.dumps(clothes_state, sort_keys=True, separators=(",", ":"))
+        designer = ClothesDesigner()
+        import torch
+        with torch.inference_mode():
+            ret = designer.process(pipe=pipe, widget_data=widget_data_str, unique_id="api_preview")
+        image_tensor = ret[0]
+
+        image_array = np.clip(255.0 * image_tensor.cpu().numpy().squeeze(), 0, 255).astype(np.uint8)
+        image_pil = Image.fromarray(image_array)
+        buffered = io.BytesIO()
+        image_pil.save(buffered, format="PNG")
+        b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+        return web.json_response({"image": b64})
+    except Exception as e:
+        log_event('exception', component='ControlCenter', level='error', exc_info=True, message='Operation failed', error=str(e))
+        return web.Response(status=500, text=str(e))
+
+
+
+@server.PromptServer.instance.routes.post("/vnccs/control_center/clothes_preview")
+@privileged_route
+async def cc_clothes_preview(request):
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+    try:
+        return await run_preview_job(_clothes_preview_response, data)
+    except Exception as exc:
+        log_event('exception', component='ControlCenter', level='error', exc_info=True, message='Operation failed', error=str(exc))
+        return web.json_response({"error": str(exc)}, status=500)
+
+@server.PromptServer.instance.routes.get("/vnccs/control_center/check")
+async def cc_check(request):
+    repo_id = request.rel_url.query.get("repo_id", "").strip()
+    if not repo_id or " " in repo_id:
+        return web.json_response({"error": "Invalid repo_id"}, status=400)
+
+    force = request.rel_url.query.get("force_refresh", "").lower() == "true"
+    if force:
+        _CC_CONFIG_CACHE.pop(repo_id, None)
+
+    try:
+        import asyncio
+
+        loop = asyncio.get_running_loop()
+        config = await loop.run_in_executor(None, lambda: _get_cc_config(repo_id, prefer_remote=force))
+    except Exception as exc:
+        err = str(exc)
+        if "404" in err or "not found" in err.lower():
+            return web.json_response({"error": "control_center.json not found in repo"}, status=404)
+        return web.json_response({"error": err}, status=500)
+
+    installed = get_installed_version_info()
+
+    # Remote catalogs may still contain retired QIE2511 entries.
+    visible_models = [
+        entry for entry in config.get("models", [])
+        if entry.get("type") != "nunchaku"
+        and _entry_kind(entry) != "qie2511"
+    ]
+    available_types = list(dict.fromkeys(
+        entry.get("type", "") for entry in visible_models if entry.get("type")
+    ))
+
+    return web.json_response({
+        "name": config.get("name", ""),
+        "source": _get_cc_config_source(repo_id),
+        "available_types": available_types,
+        "models": _enrich_config_entries(visible_models, "models", installed),
+        "clip": _enrich_config_entries([e for e in config.get("clip", []) if _entry_kind(e) != "qie2511"], "clip", installed),
+        "vae": _enrich_config_entries([e for e in config.get("vae", []) if _entry_kind(e) != "qie2511"], "vae", installed),
+        "lora": _enrich_config_entries([e for e in config.get("lora", []) if _entry_kind(e) != "qie2511"], "lora", installed),
+        "controlnet": _enrich_config_entries(config.get("controlnet", []), "controlnet", installed),
+        "other": _enrich_config_entries(config.get("other", []), "other", installed),
+    })
+
+
+@server.PromptServer.instance.routes.get("/vnccs/control_center/lora_files")
+async def cc_lora_files(request):
+    repo_id = request.rel_url.query.get("repo_id", "").strip()
+    try:
+        available = folder_paths.get_filename_list("loras") or []
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+
+    added_paths = set()
+    if repo_id and " " not in repo_id:
+        try:
+            config = _get_cc_config(repo_id)
+            added_paths = {
+                _rel_within_folder(entry.get("local_path", ""))
+                for entry in config.get("lora", [])
+                if isinstance(entry, dict) and entry.get("local_path")
+            }
+        except Exception:
+            added_paths = set()
+
+    items = []
+    for rel_path in sorted(set(available), key=lambda value: value.lower()):
+        items.append({
+            "path": rel_path,
+            "label": os.path.basename(rel_path),
+            "already_added": rel_path in added_paths,
+        })
+    return web.json_response({"items": items})
+
+
+@server.PromptServer.instance.routes.post("/vnccs/control_center/custom_lora")
+@privileged_route
+async def cc_add_custom_lora(request):
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    if not isinstance(data, dict) or any(data.get(field) is not None and not isinstance(data[field], str) for field in ("repo_id", "path", "kind")):
+        return web.json_response({"error": "Custom LoRA fields must be strings in an object"}, status=400)
+    repo_id = (data.get("repo_id") or "").strip()
+    rel_path = (data.get("path") or "").strip().replace("\\", "/")
+    kind = str(data.get("kind") or "Custom").strip() or "Custom"
+    if not repo_id or " " in repo_id:
+        return web.json_response({"error": "Invalid repo_id"}, status=400)
+    if not rel_path:
+        return web.json_response({"error": "LoRA path is required"}, status=400)
+    if kind not in {"Custom", "QI2", "Klein9b", "MiniMaxH3"}:
+        return web.json_response({"error": "Unsupported model family"}, status=400)
+
+    try:
+        config = _get_cc_config(repo_id)
+        existing_paths = {
+            entry.get("local_path", "").replace("\\", "/")
+            for entry in config.get("lora", [])
+            if isinstance(entry, dict) and entry.get("local_path")
+        }
+        target_local_path = f"models/loras/{rel_path}"
+        if target_local_path in existing_paths:
+            return web.json_response({"error": "LoRA already exists in the list"}, status=409)
+
+        used_names = {
+            entry.get("name")
+            for entry in config.get("lora", [])
+            if isinstance(entry, dict) and entry.get("name")
+        }
+        entry = _build_custom_lora_entry(rel_path, used_names=used_names, kind=kind)
+        _save_custom_loras([entry])
+        _CC_CONFIG_CACHE.pop(repo_id, None)
+        return web.json_response({"status": "ok", "entry": entry})
+    except FileNotFoundError as exc:
+        return web.json_response({"error": str(exc)}, status=404)
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+
+
+@server.PromptServer.instance.routes.post("/vnccs/control_center/custom_lora/delete")
+@privileged_route
+async def cc_delete_custom_lora(request):
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    if not isinstance(data, dict) or any(data.get(field) is not None and not isinstance(data[field], str) for field in ("repo_id", "local_path", "name")):
+        return web.json_response({"error": "Custom LoRA fields must be strings in an object"}, status=400)
+    repo_id = (data.get("repo_id") or "").strip()
+    local_path = (data.get("local_path") or "").strip().replace("\\", "/")
+    name = (data.get("name") or "").strip()
+    if not repo_id or " " in repo_id:
+        return web.json_response({"error": "Invalid repo_id"}, status=400)
+    if not local_path and not name:
+        return web.json_response({"error": "Custom LoRA identifier is required"}, status=400)
+
+    try:
+        removed = _remove_custom_lora(local_path=local_path, name=name)
+        if not removed:
+            return web.json_response({"error": "Custom LoRA not found"}, status=404)
+        _CC_CONFIG_CACHE.pop(repo_id, None)
+        return web.json_response({"status": "ok"})
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+
+
+@server.PromptServer.instance.routes.post("/vnccs/control_center/download")
+async def cc_download(request):
+    try:
+        validate_privileged_request(request)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=403)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    if not isinstance(data, dict) or any(not isinstance(data.get(field, ""), str) for field in ("repo_id", "category", "name")):
+        return web.json_response({"error": "Download fields must be strings in an object"}, status=400)
+    repo_id = data.get("repo_id", "").strip()
+    category = data.get("category", "models")
+    name = data.get("name", "")
+
+    if not repo_id or " " in repo_id:
+        return web.json_response({"error": "Invalid repo_id"}, status=400)
+    if category not in {"models", "clip", "vae", "lora", "controlnet", "other"}:
+        return web.json_response({"error": "Unsupported model category"}, status=400)
+
+    try:
+        import asyncio
+
+        loop = asyncio.get_running_loop()
+        config = await loop.run_in_executor(None, lambda: _get_cc_config(repo_id, prefer_remote=True))
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+
+    entry = _find_entry(config.get(category, []), name)
+    if not entry:
+        return web.json_response({"error": f"Entry '{name}' not found in '{category}'"}, status=404)
+    try:
+        target_path = _resolve_model_download_path(entry.get("local_path", ""))
+        if entry.get("url"):
+            return web.json_response({"error": "Direct URL downloads are disabled; use hf_repo and hf_path"}, status=400)
+        if not entry.get("hf_path"):
+            return web.json_response({"error": "Entry must define hf_path"}, status=400)
+        _validate_model_filename(entry["hf_path"])
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+
+    key = f"cc_{category}_{entry['name']}"
+    target = (repo_id, target_path)
+    with _DOWNLOAD_QUEUE_LOCK:
+        current = _DOWNLOAD_STATUS.get(key, {})
+        if current.get("status") in {"queued", "downloading"}:
+            if _DOWNLOAD_TARGETS.get(key, target) != target:
+                return web.json_response({"error": "A different catalog model with this name is already downloading. Wait for it to finish, then retry."}, status=409)
+            return web.json_response(dict(current))
+        _DOWNLOAD_TARGETS[key] = target
+        _DOWNLOAD_STATUS[key] = {"status": "queued", "message": "Queued..."}
+        _DOWNLOAD_QUEUE.put((repo_id, key, entry))
+    return web.json_response({"status": "queued", "message": f"Download queued for {name}"})
+
+
+@server.PromptServer.instance.routes.get("/vnccs/manager/status")
+async def get_download_status(request):
+    repo_id = request.rel_url.query.get("repo_id", "").strip()
+    with _DOWNLOAD_QUEUE_LOCK:
+        statuses = {key: value for key, value in _DOWNLOAD_STATUS.items()
+                    if not repo_id or key not in _DOWNLOAD_TARGETS or _DOWNLOAD_TARGETS[key][0] == repo_id}
+    return web.json_response(statuses)
+
+
+@server.PromptServer.instance.routes.get("/vnccs/manager/install_policy")
+async def vnccs_manager_install_policy(request):
+    try:
+        return web.json_response(_get_manager_install_policy())
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+
+
+@server.PromptServer.instance.routes.post("/vnccs/manager/enable_personal_cloud")
+async def vnccs_manager_enable_personal_cloud(request):
+    try:
+        validate_privileged_request(request)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=403)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+    if not isinstance(data, dict):
+        return web.json_response({"error": "Manager policy fields must be an object"}, status=400)
+    if data.get("confirmation") != "enable_personal_cloud":
+        return web.json_response({"error": "Explicit confirmation is required."}, status=400)
+
+    try:
+        result = _enable_manager_personal_cloud()
+        result["policy"] = _get_manager_install_policy()
+        return web.json_response(result)
+    except RuntimeError as exc:
+        return web.json_response({"error": str(exc)}, status=409)
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+
+
+@server.PromptServer.instance.routes.get("/vnccs/module_status")
+async def vnccs_module_status(request):
+    import re
+
+    custom_nodes_roots = _custom_nodes_roots()
+    modules = {
+        "main": ["vnccs", "ComfyUI_VNCCS"],
+        "utils": ["vnccs-utils", "ComfyUI_VNCCS_Utils"],
+    }
+    dependency_modules = {
+        "impact_pack": {
+            "label": "Impact Pack",
+            "github_url": "https://github.com/ltdrdata/ComfyUI-Impact-Pack",
+            "manager_id": "comfyui-impact-pack",
+            "folders": ["ComfyUI-Impact-Pack"],
+            "nodes": [
+                {"class_names": ["SAMLoader"]},
+                {"class_names": ["FaceDetailer"]},
+            ],
+        },
+        "impact_subpack": {
+            "label": "Impact Subpack",
+            "github_url": "https://github.com/ltdrdata/ComfyUI-Impact-Subpack",
+            "manager_id": "comfyui-impact-subpack",
+            "folders": ["ComfyUI-Impact-Subpack"],
+            "nodes": [
+                {"class_names": ["UltralyticsDetectorProvider"]},
+            ],
+        },
+        "easy_sam3": {
+            "label": "Easy SAM3",
+            "github_url": "https://github.com/yolain/ComfyUI-Easy-Sam3",
+            "manager_id": "comfyui-easy-sam3",
+            "darwin_compatibility_warning": "The current Easy SAM3 release requires decord and Triton. Neither supports the macOS/MPS Desktop runtime, so installation or import may fail until the upstream package adds macOS support.",
+            "folders": ["ComfyUI-Easy-Sam3", "comfyui-easy-sam3"],
+            "nodes": [
+                {"node_id": "easy sam3ModelLoader", "class_names": ["LoadSam3Model"]},
+                {"node_id": "easy sam3ImageSegmentation", "class_names": ["Sam3ImageSegmentation"]},
+            ],
+        },
+    }
+
+    def read_version(dirpath):
+        pyproject = os.path.join(dirpath, "pyproject.toml")
+        if not os.path.exists(pyproject):
+            return None
+        try:
+            with open(pyproject, "r", encoding="utf-8") as handle:
+                content = handle.read()
+            match = re.search(r'^version\s*=\s*["\']([^"\']+)["\']', content, re.MULTILINE)
+            return match.group(1) if match else None
+        except Exception:
+            return None
+
+    def comfy_node_available(spec):
+        return _registered_node_class(spec) is not None
+
+    def dependency_status(spec):
+        is_darwin = platform.system().lower() == "darwin"
+        manager_metadata = {
+            "manager_id": spec.get("manager_id"),
+            "manager_version": "latest",
+            "compatibility_note": spec.get("darwin_compatibility_warning") if is_darwin else None,
+        }
+        folders = []
+        for root in custom_nodes_roots:
+            for folder in spec.get("folders", []):
+                path = os.path.join(root, folder)
+                if os.path.isdir(path) and folder not in folders:
+                    folders.append(folder)
+
+        missing_nodes = []
+        for node_spec in spec.get("nodes", []):
+            if not comfy_node_available(node_spec):
+                missing_nodes.append(node_spec.get("node_id") or "/".join(node_spec.get("class_names", [])))
+
+        if not missing_nodes:
+            return {
+                "label": spec["label"],
+                "github_url": spec.get("github_url"),
+                **manager_metadata,
+                "status": "ok",
+                "folder": folders[0] if folders else None,
+                "missing_nodes": [],
+            }
+        return {
+            "label": spec["label"],
+            "github_url": spec.get("github_url"),
+            **manager_metadata,
+            "status": "unsupported" if manager_metadata.get("compatibility_note") else ("partial" if folders else "missing"),
+            "folder": folders[0] if folders else None,
+            "missing_nodes": missing_nodes,
+        }
+
+    result = {}
+    for key, name_variants in modules.items():
+        found = []
+        found_paths = set()
+        for root in custom_nodes_roots:
+            for name in name_variants:
+                path = os.path.join(root, name)
+                normalized_path = os.path.normcase(os.path.abspath(path))
+                if os.path.isdir(path) and normalized_path not in found_paths:
+                    found_paths.add(normalized_path)
+                    found.append({"folder": name, "version": read_version(path)})
+
+        if not found:
+            result[key] = {"error": "not_found"}
+        elif len(found) > 1:
+            preferred = found[0]
+            result[key] = {
+                "version": preferred["version"],
+                "folder": preferred["folder"],
+                "duplicate": True,
+                "duplicate_folders": [item["folder"] for item in found],
+            }
+        else:
+            result[key] = {
+                "version": found[0]["version"],
+                "folder": found[0]["folder"],
+                "duplicate": False,
+            }
+
+    result["dependencies"] = {
+        key: dependency_status(spec)
+        for key, spec in dependency_modules.items()
+    }
+    result["comfyui"] = h3_runtime_status()
+
+    return web.json_response(result)
+
+
+NODE_CLASS_MAPPINGS = {
+    "VNCCS_ControlCenter": VNCCS_ControlCenter,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "VNCCS_ControlCenter": "VNCCS Control Center",
+}

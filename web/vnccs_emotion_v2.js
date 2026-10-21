@@ -1,0 +1,3344 @@
+import { app } from "../../scripts/app.js";
+import { createSakuraInteractions } from "./sakura_interactions.mjs";
+import { vnccsApi as api, mediaURL, storage } from "./vnccs_transport.js";
+import { showModal as showCommonModal, SAKURA_THEME_CSS, SAKURA_INTERACTION_CSS, registerCleanup, createRequestGuard, syncDOMWidgetWidth, syncDOMWidgetWidthSoon, enableMiddleMouseCanvasPan, attachHelpTooltips, setHelpText, createSpritePreviewNavigator, createControlCenterClient, installResolvedSeedTransport } from "./vnccs_common.js";
+
+// --- CSS STYLES: Sakura Archive Design System ---
+const STYLE = `
+@import url('https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
+${SAKURA_INTERACTION_CSS}
+
+/* ── Variables ── */
+.ems-container {
+${SAKURA_THEME_CSS}
+}
+
+/* ── Container ── */
+.ems-container {
+    position: relative;
+    display: flex;
+    flex-direction: row;
+    gap: 10px;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-family: var(--font);
+    font-size: 24px;
+    padding: 10px;
+    border-radius: 8px;
+    width: 100%;
+    height: 100%;
+    max-height: 100%;
+    box-sizing: border-box;
+    overflow: hidden;
+    background-image: radial-gradient(ellipse at 15% 0%, rgba(255, 143, 163, 0.05) 0%, transparent 55%),
+                      radial-gradient(ellipse at 85% 100%, rgba(184, 169, 232, 0.04) 0%, transparent 55%);
+}
+
+/* ── Columns ── */
+.ems-left-col {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-width: 200px;
+    overflow: hidden;
+}
+
+.ems-right-col {
+    flex: 3;
+    display: flex;
+    flex-direction: row;
+    gap: 10px;
+    min-width: 300px;
+    overflow: hidden;
+}
+.ems-selection-col {
+    flex: 1 1 auto;
+    min-width: 420px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    overflow: hidden;
+}
+
+/* ── Sections ── */
+.ems-section {
+    border: 1px solid var(--accent-border);
+    border-radius: var(--radius-lg);
+    background: rgba(20, 16, 30, 0.88);
+    padding: 8px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    position: relative;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
+}
+.ems-section::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 18%; right: 18%;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(255, 143, 163, 0.6), transparent);
+    border-radius: 1px;
+    pointer-events: none;
+}
+
+/* ── Character Header ── */
+.ems-char-header {
+    color: var(--accent);
+    padding: 4px 8px 8px;
+    font-weight: 700;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    margin-bottom: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.ems-char-preview-container {
+    flex: 1;
+    background: radial-gradient(circle, rgba(255, 143, 163, 0.04) 1px, transparent 1px), rgba(10, 8, 16, 0.6);
+    background-size: 18px 18px, 100% 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-md);
+    border: 1px solid var(--border);
+    overflow: hidden;
+    position: relative;
+}
+
+.ems-char-preview {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+}
+.ems-char-preview-loading {
+    position: absolute;
+    inset: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    background: rgba(10, 10, 16, 0.28);
+    backdrop-filter: blur(1px);
+    pointer-events: none;
+}
+.ems-char-preview-loading.is-visible { display: flex; }
+.ems-char-preview-loading::before {
+    content: '';
+    width: 34px;
+    height: 34px;
+    border: 2px solid rgba(255, 143, 163, 0.24);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    box-shadow: 0 0 18px rgba(255,143,163,0.25);
+    animation: ems-spin 0.75s linear infinite;
+}
+.ems-sprite-nav {
+    display: none;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding-top: 7px;
+    pointer-events: auto;
+}
+.ems-sprite-nav.is-visible { display: flex; }
+.ems-sprite-nav-btn {
+    width: 34px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--accent-border);
+    border-radius: var(--radius-md);
+    background: linear-gradient(180deg, rgba(255,143,163,0.14), rgba(255,255,255,0.04));
+    color: var(--accent);
+    box-shadow: 0 0 12px rgba(255,143,163,0.12);
+    cursor: pointer;
+    transition: all var(--transition);
+}
+.ems-sprite-nav-btn:hover {
+    border-color: var(--accent);
+    background: linear-gradient(180deg, rgba(255,143,163,0.22), rgba(255,255,255,0.06));
+    box-shadow: 0 0 16px rgba(255,143,163,0.22);
+}
+.ems-sprite-nav-btn:disabled { opacity: 0.55; cursor: default; }
+.ems-sprite-nav-btn svg {
+    width: 16px;
+    height: 16px;
+    stroke: currentColor;
+    stroke-width: 2.6;
+    fill: none;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+}
+.ems-sprite-nav-count {
+    min-width: 46px;
+    text-align: center;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--text-secondary);
+}
+.ems-pose-selection {
+    margin-top: 7px;
+    padding: 7px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: rgba(10, 8, 16, 0.55);
+}
+.ems-pose-selection-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 6px;
+}
+.ems-pose-selection-title {
+    color: var(--accent);
+    font-size: 9px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+.ems-pose-selection-summary {
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
+    font-size: 9px;
+}
+.ems-pose-grid {
+    display: grid;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: 4px;
+}
+.ems-pose-chip {
+    min-width: 0;
+    height: 24px;
+    padding: 0;
+    border: 1px solid var(--border-hover);
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.035);
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    font-size: 9px;
+    cursor: pointer;
+}
+.ems-pose-chip.selected {
+    border-color: var(--accent-border);
+    background: rgba(255, 143, 163, 0.16);
+    color: var(--accent-hover);
+}
+.ems-pose-chip.current {
+    outline: 1px solid var(--accent-lavender);
+    outline-offset: 1px;
+}
+.ems-pose-selection-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 5px;
+    margin-top: 6px;
+}
+.ems-pose-selection-action {
+    height: 24px;
+    border: 1px solid var(--accent-border);
+    border-radius: 6px;
+    background: rgba(255, 143, 163, 0.08);
+    color: var(--text-secondary);
+    font-size: 9px;
+    font-weight: 700;
+    cursor: pointer;
+}
+@keyframes ems-spin { to { transform: rotate(360deg); } }
+
+/* ── Costumes ── */
+.ems-costumes-header {
+    font-weight: 700;
+    color: var(--accent);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    margin-bottom: 6px;
+    padding-left: 4px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.ems-costumes-header::before {
+    content: '';
+    width: 3px;
+    height: 10px;
+    background: linear-gradient(180deg, var(--accent), var(--accent-lavender));
+    border-radius: 2px;
+    box-shadow: 0 0 6px var(--accent-glow);
+    flex-shrink: 0;
+}
+.ems-costumes-list {
+    background: rgba(10, 8, 16, 0.5);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 8px 12px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    color: var(--text-primary);
+    max-height: 120px;
+    overflow-y: auto;
+}
+.ems-costumes-list::-webkit-scrollbar { height: 3px; width: 3px; }
+.ems-costumes-list::-webkit-scrollbar-thumb { background: var(--accent-border); border-radius: 2px; }
+
+/* ── Costume Toggle Items ── */
+.ems-checkbox-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    user-select: none;
+}
+.ems-checkbox-item span {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+.em-toggle {
+    position: relative;
+    width: 34px;
+    height: 18px;
+    flex-shrink: 0;
+}
+.em-toggle input { opacity: 0; width: 0; height: 0; position: absolute; }
+.em-toggle-track {
+    position: absolute;
+    inset: 0;
+    border-radius: 18px;
+    background: rgba(255, 255, 255, 0.07);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    transition: all var(--transition);
+}
+.em-toggle input:checked + .em-toggle-track {
+    background: rgba(255, 143, 163, 0.22);
+    border-color: var(--accent-border);
+    box-shadow: 0 0 8px var(--accent-subtle);
+}
+.em-toggle-thumb {
+    position: absolute;
+    top: 3px; left: 3px;
+    width: 12px; height: 12px;
+    border-radius: 50%;
+    background: var(--text-muted);
+    transition: all var(--transition);
+}
+.em-toggle input:checked ~ .em-toggle-thumb {
+    transform: translateX(16px);
+    background: var(--accent);
+    box-shadow: 0 0 6px var(--accent-glow);
+}
+
+/* ── Emotions Grid ── */
+.ems-selected-emotions-wrap {
+    flex: 0 0 auto;
+    background: rgba(8, 6, 14, 0.5);
+    border: 1px solid var(--accent-border);
+    border-radius: var(--radius-md);
+    padding: 8px;
+    margin-bottom: 8px;
+}
+.ems-selected-emotions-header {
+    color: var(--accent);
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    margin: 0 0 8px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.ems-selected-emotions-header::before {
+    content: '';
+    width: 3px;
+    height: 10px;
+    background: linear-gradient(180deg, var(--accent), var(--accent-lavender));
+    border-radius: 2px;
+    box-shadow: 0 0 6px var(--accent-glow);
+    flex-shrink: 0;
+}
+.ems-selected-emotions-list {
+    display: grid;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: 8px;
+    align-content: start;
+    align-items: start;
+    max-height: 178px;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--accent-border) transparent;
+}
+.ems-selected-emotions-list::-webkit-scrollbar { width: 4px; }
+.ems-selected-emotions-list::-webkit-scrollbar-thumb { background: var(--accent-border); border-radius: 2px; }
+.ems-selected-emotions-empty {
+    color: var(--text-muted);
+    font-size: 12px;
+    font-weight: 600;
+    padding: 10px;
+    text-align: center;
+    border: 1px dashed var(--border-hover);
+    border-radius: var(--radius-sm);
+}
+.ems-emotions-container {
+    flex: 1;
+    background: rgba(8, 6, 14, 0.5);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 10px;
+    overflow-y: auto;
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+    align-content: start;
+    align-items: start;
+    min-height: 200px;
+    scrollbar-width: thin;
+    scrollbar-color: var(--accent-border) transparent;
+}
+.ems-emotions-container::-webkit-scrollbar { width: 4px; }
+.ems-emotions-container::-webkit-scrollbar-thumb { background: var(--accent-border); border-radius: 2px; }
+
+.ems-emotion-item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    align-self: start;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    width: 100%;
+    padding: 6px;
+    border-radius: var(--radius-sm);
+    border: 1px solid transparent;
+    box-sizing: border-box;
+    background: transparent;
+}
+.ems-emotion-item:hover:not(.selected) {
+    background: rgba(255, 143, 163, 0.06);
+    border-color: var(--accent-border);
+}
+.ems-emotion-item.selected {
+    background: rgba(255, 143, 163, 0.15);
+    border-color: var(--accent);
+    box-shadow: 0 0 12px var(--accent-subtle), inset 0 0 8px rgba(255, 143, 163, 0.05);
+}
+.ems-emotion-item.selected .ems-emotion-label {
+    color: var(--accent-hover);
+    font-weight: 600;
+}
+
+.ems-emotion-img {
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    object-fit: cover;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    transition: border-color var(--transition);
+}
+.ems-emotion-img-placeholder {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(255, 255, 255, 0.035);
+    color: var(--text-muted);
+    font-size: 24px;
+    font-weight: 700;
+}
+.ems-emotion-item.selected .ems-emotion-img {
+    border-color: var(--accent-border);
+}
+.ems-emotion-label {
+    font-size: 20px;
+    color: var(--text-secondary);
+    text-align: center;
+    margin-top: 4px;
+    font-family: var(--font);
+    font-weight: 500;
+    word-break: break-word;
+    width: 100%;
+    line-height: 1.2;
+}
+.ems-emotion-item.compact {
+    padding: 4px;
+}
+.ems-emotion-item.compact .ems-emotion-label {
+    font-size: 12px;
+    margin-top: 3px;
+}
+.ems-emotion-item.add-custom {
+    border: 1px dashed var(--accent-border);
+    background: rgba(255, 143, 163, 0.05);
+}
+.ems-emotion-item.add-custom:hover:not(.selected) {
+    background: rgba(255, 143, 163, 0.1);
+}
+.ems-emotion-add-box {
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    border-radius: var(--radius-sm);
+    border: 1px dashed rgba(255, 143, 163, 0.45);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--accent-hover);
+    font-size: 28px;
+    font-weight: 500;
+    box-sizing: border-box;
+    background: rgba(255, 255, 255, 0.025);
+}
+.ems-emotion-item.add-custom .ems-emotion-label {
+    color: var(--accent-hover);
+    font-weight: 700;
+    font-size: 11px;
+}
+
+/* ── Footer / Button ── */
+.ems-footer {
+    margin-top: 6px;
+    display: flex;
+    justify-content: center;
+}
+.ems-btn {
+    appearance: none;
+    -webkit-appearance: none;
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent-hover) 100%) !important;
+    background-color: var(--accent) !important;
+    background-image: linear-gradient(135deg, var(--accent) 0%, var(--accent-hover) 100%) !important;
+    color: #1a1525;
+    border: none;
+    border-radius: var(--radius-md);
+    padding: 10px 32px;
+    font-family: var(--font);
+    font-weight: 700;
+    font-size: 22px;
+    letter-spacing: 0.5px;
+    cursor: pointer;
+    box-shadow: 0 4px 20px rgba(255, 143, 163, 0.25);
+    position: relative;
+    overflow: hidden;
+    transition: all var(--transition);
+    text-transform: uppercase;
+    -webkit-tap-highlight-color: rgba(255,143,163,0.22);
+}
+.ems-btn::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.2) 45%, rgba(255,255,255,0.28) 50%, rgba(255,255,255,0.2) 55%, transparent 100%);
+    transform: translateX(-120%) skewX(-15deg);
+    animation: emBtnShimmer 3.5s ease-in-out infinite;
+    pointer-events: none;
+}
+@keyframes emBtnShimmer {
+    0%   { transform: translateX(-120%) skewX(-15deg); opacity: 1; }
+    35%  { transform: translateX(120%)  skewX(-15deg); opacity: 1; }
+    100% { transform: translateX(120%)  skewX(-15deg); opacity: 0; }
+}
+.ems-btn:hover:not(:disabled) {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 30px rgba(255, 143, 163, 0.45);
+}
+.ems-btn:focus:not(:disabled),
+.ems-btn:focus-visible:not(:disabled),
+.ems-btn:active:not(:disabled) {
+    outline: none;
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent-hover) 100%) !important;
+    color: #1a1525 !important;
+    box-shadow: 0 8px 30px rgba(255, 143, 163, 0.45), 0 0 0 2px rgba(255,143,163,0.28);
+}
+.ems-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+.ems-btn.cancel {
+    background: rgba(255, 71, 87, 0.15);
+    color: var(--error);
+    border: 1px solid rgba(255, 71, 87, 0.3);
+    box-shadow: none;
+}
+.ems-btn.cancel::after { display: none; }
+.ems-btn.cancel:hover:not(:disabled) {
+    background: rgba(255, 71, 87, 0.28);
+    box-shadow: 0 4px 16px rgba(255, 71, 87, 0.2);
+}
+
+/* ── Search Input ── */
+.ems-search-input {
+    width: 100%;
+    padding: 8px 14px;
+    margin-top: 6px;
+    margin-bottom: 6px;
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--text-primary);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: var(--radius-md);
+    font-size: 14px;
+    font-family: var(--font);
+    box-sizing: border-box;
+    transition: all var(--transition);
+}
+.ems-search-input:focus {
+    outline: none;
+    border-color: var(--accent-border);
+    background: rgba(255, 143, 163, 0.03);
+    box-shadow: 0 0 0 3px rgba(255, 143, 163, 0.05);
+}
+.ems-search-input::placeholder { color: var(--text-muted); }
+
+/* ── Custom Select Style ── */
+.em-select {
+    width: 100%;
+    padding: 6px 10px;
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--text-primary);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: var(--radius-md);
+    font-family: var(--font);
+    font-size: 13px;
+    font-weight: 500;
+    transition: all var(--transition);
+    cursor: pointer;
+}
+.em-select:focus {
+    outline: none;
+    border-color: var(--accent-border);
+    box-shadow: 0 0 0 2px rgba(255, 143, 163, 0.08);
+}
+
+/* ── Generation Panel ── */
+.ems-generation-section {
+    flex: 0 0 460px;
+    gap: 10px;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--accent-border) transparent;
+}
+.ems-generation-section::-webkit-scrollbar { width: 4px; }
+.ems-generation-section::-webkit-scrollbar-thumb { background: var(--accent-border); border-radius: 2px; }
+.ems-generation-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+}
+.ems-qi2-cache {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+    padding: 10px;
+    border: 1px solid var(--accent-border);
+    border-radius: var(--radius-md);
+    background: rgba(255, 143, 163, 0.07);
+}
+.ems-qi2-cache-title {
+    grid-column: 1 / -1;
+    color: var(--accent-hover);
+    font-size: 11px;
+    font-weight: 900;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+.ems-tab-row {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+}
+.ems-tab,
+.ems-seed-dice {
+    appearance: none;
+    -webkit-appearance: none;
+    border: 1px solid var(--border-hover);
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text-secondary);
+    border-radius: var(--radius-md);
+    font-family: var(--font);
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    cursor: pointer;
+    transition: all var(--transition);
+}
+.ems-tab {
+    min-height: 34px;
+    font-size: 11px;
+}
+.ems-tab:hover:not(.active),
+.ems-tab:focus,
+.ems-tab:focus-visible,
+.ems-tab:active {
+    outline: none;
+    color: var(--text-primary);
+    border-color: var(--accent-border);
+    background: rgba(255, 143, 163, 0.12) !important;
+}
+.ems-tab.active {
+    color: var(--accent-hover);
+    border-color: var(--accent);
+    background: rgba(255, 143, 163, 0.2) !important;
+    box-shadow: inset 0 0 0 1px rgba(255, 143, 163, 0.1), 0 0 18px rgba(255, 143, 163, 0.12);
+}
+.ems-model-card {
+    min-height: 58px;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: flex-start;
+    gap: 5px;
+    padding: 10px 12px;
+    border-radius: var(--radius-md);
+    border: 1px solid var(--accent-border);
+    background: rgba(255, 143, 163, 0.12);
+    box-sizing: border-box;
+    overflow: hidden;
+}
+.ems-model-picker {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.ems-model-card-list {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+}
+.ems-model-picker-menu {
+    display: none;
+    flex-direction: column;
+    gap: 8px;
+    padding: 8px;
+    border: 1px solid rgba(255,143,163,0.18);
+    border-radius: 10px;
+    background: rgba(8,8,12,0.48);
+}
+.ems-model-picker.is-open .ems-model-picker-menu {
+    display: flex;
+}
+.ems-model-picker-group {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+}
+.ems-model-picker-group-title {
+    color: var(--accent-hover);
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+}
+.ems-model-card.is-installed {
+    cursor: pointer;
+}
+.ems-model-card.is-selected {
+    border-color: var(--accent);
+    background: rgba(255, 143, 163, 0.12);
+    box-shadow: 0 0 0 1px rgba(255,143,163,0.12) inset;
+}
+.ems-model-card.is-missing {
+    opacity: 0.92;
+}
+.ems-model-card-top {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    min-width: 0;
+}
+.ems-model-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1;
+    min-width: 0;
+    color: var(--text-primary);
+    font-size: 13px;
+    font-weight: 800;
+    line-height: 1.2;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.ems-model-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--success);
+    box-shadow: 0 0 10px rgba(0, 214, 143, 0.38);
+    flex-shrink: 0;
+}
+.ems-model-desc {
+    margin-top: 4px;
+    color: var(--text-secondary);
+    font-size: 10px;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.ems-model-status {
+    color: var(--success);
+    font-size: 10px;
+    font-weight: 900;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    flex-shrink: 0;
+}
+.ems-model-status.ok { color: var(--success); }
+.ems-model-status.missing { color: var(--error); }
+.ems-model-status.progress { color: var(--accent-lavender); }
+.ems-model-dot.missing { background: var(--error); }
+.ems-model-dot.progress { background: var(--accent-lavender); }
+.ems-model-card-download {
+    width: 100%;
+    padding: 7px 9px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--accent-border);
+    background: rgba(255,143,163,0.08);
+    color: var(--accent-hover);
+    font-family: var(--font);
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    cursor: pointer;
+}
+.ems-model-card-download:hover {
+    background: rgba(255,143,163,0.14);
+}
+.ems-toggle {
+    position: relative;
+    width: 36px;
+    height: 20px;
+    flex-shrink: 0;
+}
+.ems-toggle input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+    position: absolute;
+}
+.ems-toggle-track {
+    position: absolute;
+    inset: 0;
+    border-radius: 10px;
+    background: rgba(255,255,255,0.08);
+    border: 1px solid var(--border);
+    transition: all var(--transition);
+}
+.ems-toggle-thumb {
+    position: absolute;
+    top: 3px;
+    left: 3px;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: var(--text-muted);
+    transition: all var(--transition);
+}
+.ems-toggle input:checked ~ .ems-toggle-track {
+    background: rgba(255,143,163,0.2);
+    border-color: var(--accent);
+    box-shadow: 0 0 8px var(--accent-glow);
+}
+.ems-toggle input:checked ~ .ems-toggle-thumb {
+    transform: translateX(16px);
+    background: var(--accent);
+}
+.ems-field {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+}
+.ems-label {
+    color: var(--text-secondary);
+    font-size: 10px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+}
+.ems-input {
+    width: 100%;
+    min-height: 40px;
+    padding: 8px 10px;
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--text-primary);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: var(--radius-sm);
+    font-family: var(--font);
+    font-size: 13px;
+    font-weight: 700;
+    box-sizing: border-box;
+}
+.ems-input:focus {
+    outline: none;
+    border-color: var(--accent-border);
+    box-shadow: 0 0 0 2px rgba(255, 143, 163, 0.08);
+}
+.ems-seed-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 44px;
+    gap: 8px;
+}
+.ems-seed-dice {
+    min-height: 40px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-secondary);
+}
+.ems-seed-dice svg {
+    width: 20px;
+    height: 20px;
+}
+.ems-seed-dice.active {
+    color: var(--accent-hover);
+    border-color: var(--accent);
+    background: rgba(255, 143, 163, 0.2) !important;
+}
+.ems-lora-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.ems-lora-card {
+    min-height: 42px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 8px 10px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--accent-border);
+    background: rgba(255, 143, 163, 0.12);
+    box-sizing: border-box;
+    cursor: pointer;
+}
+.ems-lora-card .ems-lora-name {
+    flex: 1;
+}
+.ems-lora-card .ems-model-status {
+    margin-left: auto;
+}
+.ems-lora-card .ems-model-card-download {
+    width: auto;
+    flex-shrink: 0;
+}
+.ems-lora-card.is-selected {
+    border-color: var(--accent);
+    background: rgba(255, 143, 163, 0.12);
+    box-shadow: 0 0 0 1px rgba(255,143,163,0.12) inset;
+}
+.ems-lora-name {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    color: var(--text-primary);
+    font-size: 12px;
+    font-weight: 800;
+}
+.ems-lora-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 90px;
+    gap: 8px;
+    padding: 8px;
+    border-radius: var(--radius-sm);
+    background: rgba(255, 255, 255, 0.025);
+    border: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+/* ── Confirm Modal ── */
+.ems-modal-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    backdrop-filter: blur(4px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+    border-radius: 8px;
+}
+.ems-modal {
+    background: rgba(22, 18, 34, 0.98);
+    border: 1px solid var(--accent-border);
+    border-radius: var(--radius-lg);
+    padding: 24px 28px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    min-width: 280px;
+    max-width: 360px;
+    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 143, 163, 0.08);
+    position: relative;
+}
+.ems-modal--custom-emotion {
+    width: min(520px, calc(100% - 32px));
+    max-width: 520px;
+}
+.ems-modal::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 18%; right: 18%;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(255, 143, 163, 0.6), transparent);
+    border-radius: 1px;
+}
+.ems-modal-text {
+    font-family: var(--font);
+    font-size: 13px;
+    color: var(--text-primary);
+    line-height: 1.6;
+}
+.ems-modal-text strong {
+    color: var(--accent);
+    font-weight: 700;
+}
+.ems-modal-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+}
+.ems-modal-btn {
+    padding: 8px 20px;
+    border-radius: var(--radius-md);
+    font-family: var(--font);
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    cursor: pointer;
+    border: none;
+    transition: all var(--transition);
+}
+.ems-modal-btn:focus,
+.ems-modal-btn:focus-visible,
+.ems-modal-btn:active {
+    outline: none;
+    box-shadow: 0 0 0 2px rgba(255,143,163,0.28);
+}
+.ems-modal-btn--cancel {
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+}
+.ems-modal-btn--cancel:hover {
+    background: rgba(255, 255, 255, 0.1);
+    color: var(--text-primary);
+}
+.ems-modal-btn--confirm {
+    appearance: none;
+    -webkit-appearance: none;
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent-hover) 100%) !important;
+    background-color: var(--accent) !important;
+    background-image: linear-gradient(135deg, var(--accent) 0%, var(--accent-hover) 100%) !important;
+    color: #1a1525;
+    box-shadow: 0 4px 16px rgba(255, 143, 163, 0.25);
+    -webkit-tap-highlight-color: rgba(255,143,163,0.22);
+}
+.ems-modal-btn--confirm:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 6px 20px rgba(255, 143, 163, 0.4);
+}
+.ems-modal-btn--confirm:focus,
+.ems-modal-btn--confirm:focus-visible,
+.ems-modal-btn--confirm:active {
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent-hover) 100%) !important;
+    color: #1a1525 !important;
+    box-shadow: 0 6px 20px rgba(255, 143, 163, 0.4), 0 0 0 2px rgba(255,143,163,0.28);
+}
+.ems-custom-form {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+.ems-custom-form textarea.ems-input {
+    min-height: 74px;
+    resize: vertical;
+    font-weight: 600;
+    line-height: 1.4;
+}
+.ems-custom-image-row {
+    display: grid;
+    grid-template-columns: 88px minmax(0, 1fr);
+    gap: 10px;
+    align-items: center;
+}
+.ems-custom-preview {
+    width: 88px;
+    aspect-ratio: 1 / 1;
+    border-radius: var(--radius-sm);
+    border: 1px dashed var(--accent-border);
+    background: rgba(255, 255, 255, 0.04);
+    object-fit: cover;
+    box-sizing: border-box;
+}
+.ems-custom-preview.is-empty {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-muted);
+    font-size: 24px;
+}
+.ems-custom-file {
+    color: var(--text-secondary);
+    font-family: var(--font);
+    font-size: 12px;
+    min-width: 0;
+}
+.ems-custom-error {
+    min-height: 16px;
+    color: var(--error);
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.ems-container :is(button, [role="button"]):focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.ems-container :is(input, select, .vnccs-common-ui-select-trigger) { box-sizing: border-box; }
+@media (prefers-reduced-motion: reduce) {
+    .ems-container *, .ems-container *::before, .ems-container *::after {
+        animation: none !important; transition: none !important;
+    }
+}
+.ems-char-preview { position: absolute; inset: 0; }
+.ems-container :is(.ems-input, .em-select) { min-height: 34px; }
+.ems-container :is(.ems-toggle-thumb, .em-toggle-thumb) { transition: transform 280ms cubic-bezier(0.22, 1, 0.36, 1), background-color 180ms ease; }
+.ems-container :is(.ems-model-card, .ems-emotion-item, .ems-tab) { transition: border-color 180ms ease, background-color 180ms ease, color 180ms ease, box-shadow 180ms ease; }
+`;
+
+// Inject Styles
+const styleEl = document.createElement("style");
+styleEl.textContent = STYLE;
+document.head.appendChild(styleEl);
+
+// --- MAIN EXTENSION ---
+
+app.registerExtension({
+    name: "VNCCS.EmotionGeneratorV2",
+
+    async setup() {
+        installResolvedSeedTransport(app, ["EmotionGeneratorV2"], "generation_settings");
+        const queuePrompt = app.queuePrompt;
+        const origQueuePrompt = (...args) => queuePrompt.apply(app, args);
+        app.queuePrompt = async function(...args) {
+            const nodes = app.graph?._nodes?.filter(n => n.type === "EmotionGeneratorV2" && n.mode !== 2 && n.mode !== 4) || [];
+            for (const node of nodes) {
+                node._randomizeSeedIfNeeded?.();
+                if (node._validateBeforeQueue && !node._validateBeforeQueue()) {
+                    return; // block queue, modal already shown inside _validateBeforeQueue
+                }
+            }
+            return origQueuePrompt(...args);
+        };
+    },
+
+    async beforeRegisterNodeDef(nodeType, nodeData, app) {
+        if (nodeData.name === "EmotionGeneratorV2") {
+            const onNodeCreated = nodeType.prototype.onNodeCreated;
+            nodeType.prototype.onNodeCreated = function () {
+                onNodeCreated?.apply(this, arguments);
+
+                const node = this;
+
+                // Set default size
+                node.setSize([920, 650]);
+                syncDOMWidgetWidthSoon(node, "emotion_ui_v2");
+
+                // Get Widgets
+                const charWidget = node.widgets.find(w => w.name === "character");
+                const modelWidget = node.widgets.find(w => w.name === "generation_model");
+                const generationSettingsWidget = node.widgets.find(w => w.name === "generation_settings");
+                const costumesDataWidget = node.widgets.find(w => w.name === "costumes_data");
+                const emotionsDataWidget = node.widgets.find(w => w.name === "emotions_data");
+
+                // Hide data widgets
+                if (costumesDataWidget) costumesDataWidget.hidden = true;
+                if (emotionsDataWidget) emotionsDataWidget.hidden = true;
+                if (modelWidget) modelWidget.hidden = true;
+                if (generationSettingsWidget) {
+                    generationSettingsWidget.hidden = true;
+                    generationSettingsWidget.options ||= {};
+                    generationSettingsWidget.options.dynamicPrompts = false;
+                }
+                const restoreErrors = new Map();
+                let disposed = false;
+                registerCleanup(node, () => { disposed = true; characterFetchToken++; characterListRefreshToken++; });
+                const beginSelectionRequest = createRequestGuard(node);
+
+                const generateRandomSeed = () => Math.floor(Math.random() * 9007199254740991);
+                const ANIMA_TURBO_LORA_NAME = "anima\\anima-turbo-lora-v0.1.safetensors";
+                const ANIMA_CLIP_NAME = "qwen_3_06b_base.safetensors";
+                const ANIMA_VAE_NAME = "qwen_image_vae.safetensors";
+                const QI2_TURBO_LORA_NAME = "QI2/Viggle/Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r128.safetensors";
+                const QI2_MODEL_NAME = "qwen_image_2.1_int8_convrot.safetensors";
+                const QI2_TURBO_MODEL_NAME = "qwen_image_2.1_turbo_int8_convrot.safetensors";
+                const isQi2TurboModel = modelName => String(modelName || "").replace(/\\/g, "/").split("/").pop() === QI2_TURBO_MODEL_NAME;
+                const QI2_CLIP_NAME = "qwen3vl_8b_int8_convrot.safetensors";
+                const QI2_VAE_NAME = "qwen_image_2.1_vae_bf16.safetensors";
+                const promptStyleForMode = (mode) => String(mode || "anima").toLowerCase() === "anima" ? "Anima" : "SDXL Style";
+                const initialSharedSeed = 0;
+                const GENERATION_DEFAULTS = {
+                    generation_mode: "anima",
+                    ckpt_name: "",
+                    diffusion_model_name: "",
+                    clip_name: ANIMA_CLIP_NAME,
+                    vae_name: ANIMA_VAE_NAME,
+                    clip_type: "stable_diffusion",
+                    sampler: "er_sde",
+                    scheduler: "simple",
+                    steps: 30,
+                    cfg: 4.0,
+                    seed: initialSharedSeed,
+                    seed_mode: "fixed",
+                    turbo_enabled: false,
+                    turbo_previous_settings: null,
+                    dmd_lora_name: ANIMA_TURBO_LORA_NAME,
+                    dmd_lora_strength: 1.0,
+                    lora_stack: [
+                        { name: "", strength: 1.0 },
+                        { name: "", strength: 1.0 },
+                        { name: "", strength: 1.0 },
+                        { name: "", strength: 1.0 },
+                        { name: "", strength: 1.0 }
+                    ],
+                    mode_settings: {
+                        illustrious: {
+                            ckpt_name: "", sampler: "euler", scheduler: "normal",
+                            steps: 20, cfg: 8.0, seed: initialSharedSeed, seed_mode: "fixed",
+                            turbo_previous_settings: null,
+                            dmd_lora_name: "", dmd_lora_strength: 1.0,
+                            lora_stack: [
+                                { name: "", strength: 1.0 },
+                                { name: "", strength: 1.0 },
+                                { name: "", strength: 1.0 },
+                                { name: "", strength: 1.0 },
+                                { name: "", strength: 1.0 }
+                            ]
+                        },
+                        anima: {
+                            diffusion_model_name: "", clip_name: ANIMA_CLIP_NAME, vae_name: ANIMA_VAE_NAME,
+                            clip_type: "stable_diffusion", sampler: "er_sde", scheduler: "simple",
+                            steps: 30, cfg: 4.0, seed: initialSharedSeed, seed_mode: "fixed",
+                            turbo_enabled: false, turbo_previous_settings: null,
+                            dmd_lora_name: ANIMA_TURBO_LORA_NAME, dmd_lora_strength: 1.0,
+                            lora_stack: [
+                                { name: "", strength: 1.0 },
+                                { name: "", strength: 1.0 },
+                                { name: "", strength: 1.0 },
+                                { name: "", strength: 1.0 },
+                                { name: "", strength: 1.0 }
+                            ]
+                        },
+                        qi2: {
+                            diffusion_model_name: QI2_MODEL_NAME,
+                            clip_name: QI2_CLIP_NAME,
+                            vae_name: QI2_VAE_NAME,
+                            clip_type: "qwen_image",
+                            sampler: "euler",
+                            scheduler: "simple",
+                            steps: 25,
+                            cfg: 3.0,
+                            seed: initialSharedSeed,
+                            seed_mode: "fixed",
+                            turbo_enabled: false,
+                            turbo_previous_settings: null,
+                            dmd_lora_name: QI2_TURBO_LORA_NAME,
+                            dmd_lora_strength: 1.0,
+                            qi2_cache: { device: "gpu", dtype: "int8" },
+                            lora_stack: [
+                                { name: "", strength: 1.0 },
+                                { name: "", strength: 1.0 },
+                                { name: "", strength: 1.0 },
+                                { name: "", strength: 1.0 },
+                                { name: "", strength: 1.0 }
+                            ]
+                        }
+                    }
+                };
+
+                function parseGenerationSettings() {
+                    try {
+                        const parsed = generationSettingsWidget?.value ? JSON.parse(generationSettingsWidget.value) : {};
+                        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Generation settings must be an object.");
+                        const isObject = value => value !== null && typeof value === "object" && !Array.isArray(value);
+                        const profiles = parsed.mode_settings === undefined ? {} : parsed.mode_settings;
+                        if (!isObject(profiles)) throw new Error("Model profiles must be an object.");
+                        for (const settings of [parsed, ...Object.values(profiles)]) {
+                            if (!isObject(settings)) throw new Error("Model profiles must contain objects.");
+                            if (settings.qi2_cache !== undefined && !isObject(settings.qi2_cache)) throw new Error("QI2 cache settings must be an object.");
+                            if (settings.turbo_previous_settings != null && !isObject(settings.turbo_previous_settings)) throw new Error("Previous turbo settings must be an object or null.");
+                            if (settings.lora_stack !== undefined && (!Array.isArray(settings.lora_stack) || settings.lora_stack.some(item => !isObject(item)))) throw new Error("LoRA settings must be objects in a list.");
+                        }
+                        const poses = parsed.selected_pose_indices;
+                        if (poses != null && (!Array.isArray(poses) || poses.some(value => {
+                            if (typeof value !== "number" && (typeof value !== "string" || !/^[+-]?\d(?:_?\d)*$/.test(value.trim()))) return true;
+                            const index = Number(String(value).replaceAll("_", ""));
+                            return !Number.isInteger(index) || index <= 0;
+                        }))) throw new Error("Selected pose indices must be positive integers in a list.");
+                        restoreErrors.delete("generation_settings");
+                        const mode = String(parsed.generation_mode || modelWidget?.value || "anima").toLowerCase();
+                        const restored = { ...GENERATION_DEFAULTS, ...GENERATION_DEFAULTS.mode_settings[mode], ...parsed, ...parsed.mode_settings?.[mode], generation_mode: mode };
+                        for (const key of ["seed", "seed_mode"]) {
+                            if (key in parsed) restored[key] = parsed[key];
+                        }
+                        for (const key of ["selected_pose_indices", "selected_preview_sprite"]) {
+                            if (key in parsed) restored[key] = parsed[key];
+                            else delete restored[key];
+                        }
+                        return restored;
+                    } catch (e) {
+                        restoreErrors.set("generation_settings", e.message);
+                        return { ...GENERATION_DEFAULTS };
+                    }
+                }
+
+                function parseSelection(widget) {
+                    if (!widget) return new Set();
+                    try {
+                        const values = JSON.parse(widget?.value || "[]");
+                        if (!Array.isArray(values)) throw new Error("Selection must be a list.");
+                        restoreErrors.delete(widget.name);
+                        return new Set(values);
+                    } catch (error) {
+                        restoreErrors.set(widget.name, error.message);
+                        return new Set();
+                    }
+                }
+
+                // State
+                let state = {
+                    character: charWidget ? charWidget.value : "",
+                    costumes: [],
+                    selectedCostumes: parseSelection(costumesDataWidget),
+                    emotions: [],
+                    selectedEmotions: parseSelection(emotionsDataWidget),
+                    searchTerm: "",
+                    selectedPreviewSprite: null,
+                    selectedPoseIndices: null,
+                    poseCount: 0,
+                    gen: parseGenerationSettings()
+                };
+                restorePoseSelectionFromGenerationSettings();
+                let receivedSerializedConfig = false;
+                let characterFetchToken = 0;
+                let spritePreviewNavigator = null;
+                let poseSelectionSummary = null;
+                let poseSelectionGrid = null;
+                const CC_REPO_ID = "MIUProject/VNCCS_v3.0";
+                const ccState = { config: null, downloadStatus: {} };
+                let localAssets = {
+                    checkpoints: [],
+                    diffusion_models: [],
+                    text_encoders: [],
+                    vae_models: [],
+                    loras: [],
+                };
+                const modelPickerOpen = { illustrious: false, anima: false, qi2: false };
+
+                node._randomizeSeedIfNeeded = () => {
+                    if ((state.gen.seed_mode || "fixed") === "randomize") {
+                        state.gen.seed = generateRandomSeed();
+                        if (generationEls.seed) generationEls.seed.value = state.gen.seed;
+                        saveGenerationSettings(false);
+                    }
+                };
+
+                const ccNormalize = (value) => String(value || "").trim().toLowerCase();
+                const ccKind = (entry) => ccNormalize(entry?.kind ?? entry?.Kind);
+                const ccType = (entry) => ccNormalize(entry?.type ?? entry?.Type);
+                const ccStatusKey = (cat, entry) => `cc_${cat}_${entry?.name || ""}`;
+                const ccRelPath = (entry) => {
+                    const localPath = String(entry?.local_path || "").replace(/\\/g, "/");
+                    const parts = localPath.split("/").filter(Boolean);
+                    if (parts.length >= 3 && parts[0] === "models") return parts.slice(2).join("/");
+                    return parts[parts.length - 1] || "";
+                };
+                const ccEntries = (section, kind, predicate = null) => {
+                    const entries = ccState.config?.[section] || [];
+                    return entries.filter(entry => {
+                        const kindOk = !kind || ccKind(entry) === ccNormalize(kind);
+                        return kindOk && (!predicate || predicate(entry));
+                    });
+                };
+                const localAssetRelSet = (items) => new Set((items || []).map(item => String(item || "").replace(/\\/g, "/")));
+                const mergeCcAndLocalEntries = (ccList, localNames, folder, type, kind) => {
+                    const localSet = localAssetRelSet(localNames);
+                    const seen = new Set();
+                    const merged = [];
+                    (ccList || []).forEach(entry => {
+                        const rel = ccRelPath(entry);
+                        if (!rel) return;
+                        seen.add(rel);
+                        merged.push({ ...entry, status: localSet.has(rel) ? "installed" : entry.status });
+                    });
+                    (localNames || []).forEach(name => {
+                        const rel = String(name || "").replace(/\\/g, "/");
+                        if (!rel || seen.has(rel)) return;
+                        seen.add(rel);
+                        merged.push({
+                            name: rel,
+                            type,
+                            kind,
+                            local_path: `models/${folder}/${rel}`,
+                            status: "installed",
+                            description: "Local ComfyUI model.",
+                            source: "local",
+                        });
+                    });
+                    return merged;
+                };
+                const ccResolveStatus = (entry, cat) => {
+                    const transient = new Set(["queued", "downloading", "error", "auth_required"]);
+                    const dls = ccState.downloadStatus[ccStatusKey(cat, entry)] || {};
+                    return transient.has(dls.status) ? dls.status : (entry?.status || "missing");
+                };
+                const ccFirstEntry = (section, kind, predicate = null) => ccEntries(section, kind, predicate)[0] || null;
+                const ccHasRequiredFamilies = (config) => {
+                    const models = config?.models || [];
+                    const clips = config?.clip || [];
+                    const vaes = config?.vae || [];
+                    const hasAnima = models.some(entry => ccKind(entry) === "anima")
+                        && clips.some(entry => ccKind(entry) === "anima")
+                        && vaes.some(entry => ccKind(entry) === "anima");
+                    const hasIllustrious = models.some(entry => ccKind(entry) === "illustrious" && ccType(entry) === "checkpoint");
+                    const hasQi2 = models.some(entry => ccKind(entry) === "qi2" && ccType(entry) === "unet")
+                        && clips.some(entry => ccKind(entry) === "qi2")
+                        && vaes.some(entry => ccKind(entry) === "qi2");
+                    return hasAnima && hasIllustrious && hasQi2;
+                };
+
+                function markNodeDirty() {
+                    node.setDirtyCanvas?.(true, true);
+                    app.graph?.setDirtyCanvas?.(true, true);
+                }
+
+                function commitWidget(widget, value, callCallback = true) {
+                    if (disposed || restoreErrors.size) return;
+                    if (!widget) return;
+                    widget.value = value;
+                    if (callCallback) widget.callback?.(value);
+                    markNodeDirty();
+                }
+
+                function selectedPoseIndexList() {
+                    if (state.selectedPoseIndices === null) return null;
+                    const poseCount = Math.max(0, Number(state.poseCount) || 0);
+                    return Array.from(state.selectedPoseIndices)
+                        .filter(index => Number.isInteger(index) && index > 0
+                            && (poseCount <= 0 || index <= poseCount))
+                        .sort((a, b) => a - b);
+                }
+
+                function syncSelectedPoseIndicesToGenerationSettings() {
+                    const indices = selectedPoseIndexList();
+                    if (indices === null) delete state.gen.selected_pose_indices;
+                    else state.gen.selected_pose_indices = indices;
+                }
+
+                function restorePoseSelectionFromGenerationSettings() {
+                    const stored = state.gen?.selected_pose_indices;
+                    state.selectedPoseIndices = Array.isArray(stored)
+                        ? new Set(
+                            stored
+                                .map(value => Number(String(value).replaceAll("_", "")))
+                                .filter(value => Number.isInteger(value) && value > 0)
+                        )
+                        : null;
+                }
+
+                function isPoseSelected(index) {
+                    return state.selectedPoseIndices === null || state.selectedPoseIndices.has(index);
+                }
+
+                function selectedPoseCount() {
+                    if (state.poseCount <= 0) return 0;
+                    return state.selectedPoseIndices === null
+                        ? state.poseCount
+                        : selectedPoseIndexList().filter(index => index <= state.poseCount).length;
+                }
+
+                function renderPoseSelection() {
+                    if (!poseSelectionSummary || !poseSelectionGrid) return;
+                    const count = state.poseCount;
+                    const selectedCount = selectedPoseCount();
+                    poseSelectionSummary.textContent = count > 0
+                        ? `${selectedCount}/${count} selected`
+                        : "No poses";
+                    poseSelectionGrid.innerHTML = "";
+                    const currentIndex = Number(state.selectedPreviewSprite?.index ?? -1) + 1;
+                    for (let index = 1; index <= count; index++) {
+                        const chip = document.createElement("button");
+                        chip.type = "button";
+                        chip.className = "ems-pose-chip";
+                        chip.classList.toggle("selected", isPoseSelected(index));
+                        chip.classList.toggle("current", currentIndex === index);
+                        chip.textContent = String(index);
+                        chip.title = `Pose ${index}: click to ${isPoseSelected(index) ? "exclude" : "include"}`;
+                        chip.onclick = () => {
+                            if (state.selectedPoseIndices === null) {
+                                state.selectedPoseIndices = new Set(
+                                    Array.from({ length: state.poseCount }, (_, itemIndex) => itemIndex + 1)
+                                );
+                            }
+                            if (state.selectedPoseIndices.has(index)) state.selectedPoseIndices.delete(index);
+                            else state.selectedPoseIndices.add(index);
+                            spritePreviewNavigator?.show(index - 1);
+                            saveGenerationSettings();
+                            renderPoseSelection();
+                        };
+                        poseSelectionGrid.appendChild(chip);
+                    }
+                }
+
+                function persistAllState() {
+                    commitWidget(charWidget, state.character, false);
+                    if (styleWidget) commitWidget(styleWidget, promptStyleForMode(state.gen.generation_mode), false);
+                    if (costumesDataWidget) commitWidget(costumesDataWidget, JSON.stringify(Array.from(state.selectedCostumes)), false);
+                    if (emotionsDataWidget) commitWidget(emotionsDataWidget, JSON.stringify(Array.from(state.selectedEmotions)), false);
+                    saveGenerationSettings(false);
+                }
+
+                function saveGenerationSettings() {
+                    const callCallback = arguments.length > 0 ? arguments[0] : true;
+                    syncSelectedPoseIndicesToGenerationSettings();
+                    const mode = (state.gen.generation_mode || "anima").toLowerCase();
+                    const sharedSeed = state.gen.seed ?? initialSharedSeed;
+                    const sharedSeedMode = state.gen.seed_mode || "fixed";
+                    state.gen.mode_settings = state.gen.mode_settings || {};
+                    state.gen.seed = sharedSeed;
+                    state.gen.seed_mode = sharedSeedMode;
+                    state.gen.mode_settings[mode] = { ...state.gen };
+                    delete state.gen.mode_settings[mode].mode_settings;
+                    for (const profileMode of ["illustrious", "anima", "qi2"]) {
+                        const profile = state.gen.mode_settings[profileMode] || { ...GENERATION_DEFAULTS.mode_settings[profileMode] };
+                        state.gen.mode_settings[profileMode] = {
+                            ...profile,
+                            seed: sharedSeed,
+                            seed_mode: sharedSeedMode,
+                        };
+                    }
+
+                    commitWidget(generationSettingsWidget, JSON.stringify(state.gen), callCallback);
+                    commitWidget(modelWidget, mode === "qi2" ? "QI2" : mode === "anima" ? "Anima" : "Illustrious", callCallback);
+                    if (styleWidget) commitWidget(styleWidget, promptStyleForMode(mode), callCallback);
+                    window.dispatchEvent(new CustomEvent("vnccs-emotion-studio-generation-mode-changed"));
+                }
+
+                function setGenerationMode(mode) {
+                    mode = ["illustrious", "anima", "qi2"].includes(mode) ? mode : "anima";
+                    const current = (state.gen.generation_mode || "anima").toLowerCase();
+                    const sharedSeed = state.gen.seed ?? initialSharedSeed;
+                    const sharedSeedMode = state.gen.seed_mode || "fixed";
+                    state.gen.mode_settings = state.gen.mode_settings || {};
+                    state.gen.mode_settings[current] = { ...state.gen };
+                    delete state.gen.mode_settings[current].mode_settings;
+
+                    const profile = state.gen.mode_settings[mode] || GENERATION_DEFAULTS.mode_settings[mode] || {};
+                    state.gen = {
+                        ...GENERATION_DEFAULTS,
+                        ...profile,
+                        mode_settings: state.gen.mode_settings,
+                        generation_mode: mode,
+                        seed: sharedSeed,
+                        seed_mode: sharedSeedMode,
+                    };
+                    syncGenerationControls();
+                    saveGenerationSettings();
+                }
+
+                function updateGenerationValue(key, value) {
+                    state.gen[key] = value;
+                    saveGenerationSettings();
+                }
+
+                function setAnimaTurboMode(enabled, loraName = ANIMA_TURBO_LORA_NAME) {
+                    if ((state.gen.generation_mode || "anima").toLowerCase() !== "anima") return;
+                    if (enabled) {
+                        if (!state.gen.turbo_enabled) {
+                            state.gen.turbo_previous_settings = {
+                                steps: state.gen.steps,
+                                cfg: state.gen.cfg,
+                            };
+                        }
+                        state.gen.turbo_enabled = true;
+                        state.gen.dmd_lora_name = loraName || ANIMA_TURBO_LORA_NAME;
+                        state.gen.dmd_lora_strength = 1.0;
+                        state.gen.steps = 12;
+                        state.gen.cfg = 1.0;
+                    } else {
+                        state.gen.turbo_enabled = false;
+                        const previous = state.gen.turbo_previous_settings || {};
+                        if (previous.steps !== undefined) state.gen.steps = previous.steps;
+                        if (previous.cfg !== undefined) state.gen.cfg = previous.cfg;
+                        state.gen.turbo_previous_settings = null;
+                    }
+                    syncGenerationControls();
+                    saveGenerationSettings();
+                }
+
+                const cardStatusLabel = (status, entry, cat) => {
+                    const dls = ccState.downloadStatus[ccStatusKey(cat, entry)] || {};
+                    if (status === "installed") return "Installed";
+                    if (status === "queued") return "Queued";
+                    if (status === "downloading") return dls.message || "Downloading";
+                    if (status === "auth_required") return "Key Required";
+                    if (status === "error") return "Error";
+                    return "Missing";
+                };
+
+                const { fetchConfig: fetchCcConfig, startPolling: startCcPolling, stopPolling: stopCcPolling } =
+                    createControlCenterClient(CC_REPO_ID, ccHasRequiredFamilies, ccState, () => renderControlCenterCards(), node);
+                const ccDownloadEntry = async (cat, entry) => {
+                    if (disposed || !entry?.name) return;
+                    const key = ccStatusKey(cat, entry);
+                    ccState.downloadStatus[key] = { status: "queued", message: "Queued..." };
+                    renderControlCenterCards();
+                    try {
+                        const response = await api.fetchApi("/vnccs/control_center/download", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json", "X-VNCCS-CSRF": "1" },
+                            body: JSON.stringify({ repo_id: CC_REPO_ID, category: cat, name: entry.name }),
+                        });
+                        const payload = await response.json();
+                        if (disposed) return;
+                        if (!response.ok || payload.error) {
+                            ccState.downloadStatus[key] = { status: "error", message: payload.error || "Download failed" };
+                            renderControlCenterCards();
+                            return;
+                        }
+                        startCcPolling();
+                    } catch (error) {
+                        if (disposed) return;
+                        ccState.downloadStatus[key] = { status: "error", message: String(error?.message || error) };
+                        renderControlCenterCards();
+                    }
+                };
+
+                const ensureAnimaDefaultAux = () => {
+                    const clip = ccFirstEntry("clip", "Anima");
+                    const vae = ccFirstEntry("vae", "Anima");
+                    state.gen.clip_name ||= clip ? ccRelPath(clip) : ANIMA_CLIP_NAME;
+                    state.gen.vae_name ||= vae ? ccRelPath(vae) : ANIMA_VAE_NAME;
+                };
+
+                const ensureQi2DefaultAux = () => {
+                    const clip = ccFirstEntry("clip", "QI2");
+                    const vae = ccFirstEntry("vae", "QI2");
+                    state.gen.clip_name ||= clip ? ccRelPath(clip) : QI2_CLIP_NAME;
+                    state.gen.vae_name ||= vae ? ccRelPath(vae) : QI2_VAE_NAME;
+                    state.gen.clip_type = "qwen_image";
+                    state.gen.qi2_cache = {
+                        device: state.gen.qi2_cache?.device || "gpu",
+                        dtype: state.gen.qi2_cache?.dtype || "int8",
+                    };
+                };
+
+                const selectCcAsset = (key, rel) => {
+                    if (!rel) return;
+                    state.gen[key] = rel;
+                    saveGenerationSettings();
+                    renderControlCenterCards();
+                };
+
+                const selectAnimaModel = (rel) => {
+                    ensureAnimaDefaultAux();
+                    modelPickerOpen.anima = false;
+                    selectCcAsset("diffusion_model_name", rel);
+                };
+
+                const selectQi2Model = (rel) => {
+                    if (!rel) return;
+                    const turboModel = isQi2TurboModel(rel);
+                    const previousTurboModel = isQi2TurboModel(state.gen.diffusion_model_name);
+                    if (rel !== state.gen.diffusion_model_name && (turboModel || previousTurboModel)) {
+                        state.gen.steps = turboModel ? 8 : 25;
+                        state.gen.cfg = turboModel ? 1.0 : 3.0;
+                        state.gen.turbo_enabled = false;
+                        state.gen.turbo_previous_settings = null;
+                    }
+                    ensureQi2DefaultAux();
+                    modelPickerOpen.qi2 = false;
+                    selectCcAsset("diffusion_model_name", rel);
+                    syncGenerationControls();
+                };
+
+                const selectIllustriousModel = (rel) => {
+                    modelPickerOpen.illustrious = false;
+                    selectCcAsset("ckpt_name", rel);
+                };
+
+                const downloadAnimaBundle = async (cat, entry) => {
+                    ensureAnimaDefaultAux();
+                    await ccDownloadEntry(cat, entry);
+                    const clip = ccFirstEntry("clip", "Anima");
+                    const vae = ccFirstEntry("vae", "Anima");
+                    if (clip && ccResolveStatus(clip, "clip") !== "installed") await ccDownloadEntry("clip", clip);
+                    if (vae && ccResolveStatus(vae, "vae") !== "installed") await ccDownloadEntry("vae", vae);
+                };
+
+                const downloadQi2Bundle = async (cat, entry) => {
+                    ensureQi2DefaultAux();
+                    await ccDownloadEntry(cat, entry);
+                    const clip = ccFirstEntry("clip", "QI2");
+                    const vae = ccFirstEntry("vae", "QI2");
+                    if (clip && ccResolveStatus(clip, "clip") !== "installed") await ccDownloadEntry("clip", clip);
+                    if (vae && ccResolveStatus(vae, "vae") !== "installed") await ccDownloadEntry("vae", vae);
+                };
+
+                const setCcTurboMode = (enabled, rel) => {
+                    const mode = (state.gen.generation_mode || "anima").toLowerCase();
+                    if (mode === "qi2" && isQi2TurboModel(state.gen.diffusion_model_name)) return;
+                    if (mode === "anima") {
+                        state.gen.dmd_lora_name = rel || state.gen.dmd_lora_name || "";
+                        setAnimaTurboMode(enabled, rel || state.gen.dmd_lora_name || ANIMA_TURBO_LORA_NAME);
+                    } else if (mode === "qi2") {
+                        if (enabled && !state.gen.turbo_enabled) {
+                            state.gen.turbo_previous_settings = { steps: state.gen.steps, cfg: state.gen.cfg };
+                        }
+                        state.gen.turbo_enabled = !!enabled;
+                        state.gen.dmd_lora_name = rel || state.gen.dmd_lora_name || QI2_TURBO_LORA_NAME;
+                        state.gen.dmd_lora_strength = enabled ? 1.0 : 0.0;
+                        if (enabled) {
+                            state.gen.steps = 6;
+                            state.gen.cfg = 1.0;
+                            state.gen.sampler = "euler";
+                            state.gen.scheduler = "simple";
+                        } else {
+                            const previous = state.gen.turbo_previous_settings || {};
+                            state.gen.steps = previous.steps ?? 25;
+                            state.gen.cfg = previous.cfg ?? 3.0;
+                            state.gen.turbo_previous_settings = null;
+                        }
+                        syncGenerationControls();
+                        saveGenerationSettings();
+                    } else {
+                        if (enabled) {
+                            if ((state.gen.dmd_lora_strength || 0) <= 0) {
+                                state.gen.turbo_previous_settings = {
+                                    steps: state.gen.steps,
+                                    cfg: state.gen.cfg,
+                                };
+                            }
+                            state.gen.dmd_lora_name = rel || state.gen.dmd_lora_name || "";
+                            state.gen.dmd_lora_strength = 1.0;
+                            state.gen.steps = 4;
+                            state.gen.cfg = 1.0;
+                        } else {
+                            state.gen.dmd_lora_name = "";
+                            state.gen.dmd_lora_strength = 0.0;
+                            const previous = state.gen.turbo_previous_settings || {};
+                            if (previous.steps !== undefined) state.gen.steps = previous.steps;
+                            if (previous.cfg !== undefined) state.gen.cfg = previous.cfg;
+                            state.gen.turbo_previous_settings = null;
+                        }
+                        syncGenerationControls();
+                        saveGenerationSettings();
+                    }
+                    renderControlCenterCards();
+                };
+
+                const buildAssetCard = ({ entry, cat, selectedValue, onSelect, compact = false, toggled = false, onToggle = null, pickerHead = false, onDownload = null }) => {
+                    const status = ccResolveStatus(entry, cat);
+                    const rel = ccRelPath(entry);
+                    const installed = status === "installed";
+                    const selected = selectedValue && rel && String(selectedValue).replace(/\\/g, "/") === rel;
+                    const progress = ["queued", "downloading"].includes(status);
+
+                    const card = document.createElement("div");
+                    card.className = "ems-model-card";
+                    card.classList.toggle("is-installed", installed);
+                    card.classList.toggle("is-selected", (cat !== "lora" || installed) && (selected || toggled));
+                    card.classList.toggle("is-missing", !installed);
+                    if (pickerHead) {
+                        card.dataset.sakuraPickerHead = "";
+                        card.dataset.sakuraFocusDefault = "";
+                    }
+                    card.dataset.focusKey = `asset-${cat}-${rel}-${pickerHead ? "head" : "option"}`;
+                    if (installed || pickerHead) {
+                        card.setAttribute("role", "button");
+                        card.tabIndex = 0;
+                        card.setAttribute("aria-pressed", String(!!selected));
+                        card.onclick = () => onSelect?.(rel, entry);
+                        card.onkeydown = event => {
+                            if (event.target === card && ["Enter", " "].includes(event.key)) {
+                                event.preventDefault(); card.click();
+                            }
+                        };
+                    }
+
+                    const top = document.createElement("div");
+                    top.className = "ems-model-card-top";
+                    const badge = document.createElement("span");
+                    badge.className = "ems-model-dot " + (installed ? "ok" : progress ? "progress" : "missing");
+                    top.appendChild(badge);
+                    const name = document.createElement("div");
+                    name.className = "ems-model-title";
+                    name.textContent = entry.name || rel || "Unknown";
+                    top.appendChild(name);
+                    const statusEl = document.createElement("div");
+                    statusEl.className = "ems-model-status " + (installed ? "ok" : progress ? "progress" : "missing");
+                    statusEl.textContent = cardStatusLabel(status, entry, cat);
+                    top.appendChild(statusEl);
+
+                    if (onToggle && installed) {
+                        const toggle = document.createElement("label");
+                        toggle.className = "ems-toggle";
+                        const input = document.createElement("input");
+                        input.type = "checkbox";
+                        input.checked = !!toggled;
+                        input.dataset.focusKey = `${card.dataset.focusKey}-toggle`;
+                        input.ariaLabel = `Enable ${entry.name || rel}`;
+                        card.dataset.toggleState = String(!!toggled);
+                        input.onchange = (event) => {
+                            event.stopPropagation();
+                            onToggle(event.target.checked, rel, entry);
+                        };
+                        input.onclick = (event) => event.stopPropagation();
+                        const track = document.createElement("span");
+                        track.className = "ems-toggle-track vnccs-common-ui-toggle-track";
+                        const thumb = document.createElement("span");
+                        thumb.className = "ems-toggle-thumb vnccs-common-ui-toggle-thumb";
+                        toggle.append(input, track, thumb);
+                        top.appendChild(toggle);
+                    }
+
+                    card.appendChild(top);
+                    if (entry.description && !compact) {
+                        const desc = document.createElement("div");
+                        desc.className = "ems-model-desc";
+                        desc.textContent = entry.description;
+                        card.appendChild(desc);
+                    }
+                    if (!installed) {
+                        const btn = document.createElement("button");
+                        btn.type = "button";
+                        btn.className = "ems-model-card-download";
+                        btn.textContent = status === "auth_required" ? "Enter Key in Control Center" : "Download";
+                        btn.disabled = progress;
+                        btn.onclick = (event) => {
+                            event.stopPropagation();
+                            if (!progress && status !== "auth_required") (onDownload || ccDownloadEntry)(cat, entry);
+                        };
+                        card.appendChild(btn);
+                    }
+                    return card;
+                };
+
+                const FIELD_HELP = {
+                    steps: "Number of sampling steps for each emotion image. Higher values can add detail but take longer.",
+                    sampler: "Sampling algorithm used to denoise emotion generations.",
+                    cfg: "Prompt guidance strength. Higher values follow the emotion prompt more strongly.",
+                    scheduler: "Noise schedule used together with the sampler.",
+                    seed: "Numeric seed for reproducible emotion generations.",
+                    seed_mode: "Toggles fixed seed versus a fresh random seed for each generation.",
+                    lora_stack: "Additional LoRAs mixed into emotion generation for the selected model mode.",
+                    lora_strength: "Strength of the LoRA in this row."
+                };
+                const helpFor = (key, fallback = "") => FIELD_HELP[key] || fallback;
+
+                function createField(label, input, helpKey = "") {
+                    const wrap = document.createElement("label");
+                    wrap.className = "ems-field";
+                    setHelpText(wrap, helpFor(helpKey));
+                    const title = document.createElement("div");
+                    title.className = "ems-label";
+                    title.innerText = label;
+                    wrap.appendChild(title);
+                    wrap.appendChild(input);
+                    return wrap;
+                }
+
+                function createNumberInput(key, min, max, step, onChange = null) {
+                    const input = document.createElement("input");
+                    input.className = "ems-input";
+                    input.dataset.focusKey = `generation-${key}`;
+                    input.type = "number";
+                    if (min !== undefined) input.min = min;
+                    if (max !== undefined) input.max = max;
+                    input.step = step;
+                    input.onchange = () => {
+                        const value = input.valueAsNumber;
+                        if (!input.checkValidity() || !Number.isFinite(value)) {
+                            syncGenerationControls();
+                            return;
+                        }
+                        if (onChange) onChange(value);
+                        else updateGenerationValue(key, value);
+                    };
+                    return input;
+                }
+
+                function createSelectInput(key, values) {
+                    const select = document.createElement("select");
+                    select.className = "ems-input";
+                    select.ariaLabel = key.replaceAll("_", " ");
+                    values.forEach(value => {
+                        const opt = document.createElement("option");
+                        opt.value = value;
+                        opt.innerText = value;
+                        select.appendChild(opt);
+                    });
+                    select.onchange = () => updateGenerationValue(key, select.value);
+                    return select;
+                }
+
+                const generationEls = {};
+                let ui = null;
+
+                const renderModelPicker = ({ containerEl, entries, cat, key, mode, emptyText, onSelect, onDownload = null }) => {
+                    if (!containerEl) return;
+                    containerEl.innerHTML = "";
+                    const picker = document.createElement("div");
+                    picker.className = "ems-model-picker";
+                    picker.dataset.sakuraPicker = mode;
+                    picker.dataset.mode = mode;
+                    picker.dataset.sakuraFocusGroup = `model-picker-${mode}`;
+                    picker.classList.toggle("is-open", !!modelPickerOpen[mode]);
+                    containerEl.appendChild(picker);
+
+                    if (!entries.length) {
+                        const empty = document.createElement("div");
+                        empty.className = "ems-model-desc";
+                        empty.textContent = emptyText;
+                        picker.appendChild(empty);
+                        return;
+                    }
+
+                    const current = String(state.gen[key] || "").replace(/\\/g, "/");
+                    const selectedEntry = entries.find(entry => ccRelPath(entry) === current) || entries[0];
+                    picker.appendChild(buildAssetCard({
+                        entry: selectedEntry,
+                        cat,
+                        selectedValue: ccRelPath(selectedEntry),
+                        pickerHead: true,
+                        onSelect: () => {
+                            modelPickerOpen[mode] = !modelPickerOpen[mode];
+                            renderControlCenterCards();
+                        },
+                        onDownload,
+                    }));
+
+                    const menu = document.createElement("div");
+                    menu.className = "ems-model-picker-menu";
+                    menu.dataset.sakuraScroll = `model-picker-${mode}`;
+                    picker.appendChild(menu);
+
+                    const appendGroup = (title, groupEntries) => {
+                        if (!groupEntries.length) return;
+                        const group = document.createElement("div");
+                        group.className = "ems-model-picker-group";
+                        const groupTitle = document.createElement("div");
+                        groupTitle.className = "ems-model-picker-group-title";
+                        groupTitle.textContent = title;
+                        group.appendChild(groupTitle);
+                        groupEntries.forEach(entry => {
+                            group.appendChild(buildAssetCard({
+                                entry,
+                                cat,
+                                selectedValue: state.gen[key] || "",
+                                onSelect,
+                                onDownload,
+                            }));
+                        });
+                        menu.appendChild(group);
+                    };
+
+                    appendGroup("VNCCS Models", entries.filter(entry => entry.source !== "local"));
+                    appendGroup("User Models", entries.filter(entry => entry.source === "local"));
+                };
+
+                const renderModeLoraCards = (containerEl, mode) => {
+                    if (!containerEl) return;
+                    containerEl.innerHTML = "";
+                    if (mode === "qi2" && isQi2TurboModel(state.gen.diffusion_model_name)) return;
+                    const kindOk = (entry) => {
+                        const kind = ccKind(entry);
+                        if (mode === "anima") return kind === "anima";
+                        if (mode === "qi2") return kind === "qi2";
+                        return kind === "sdxl" || kind === "illustrious";
+                    };
+                    const turboEntries = (ccState.config?.lora || []).filter(entry => kindOk(entry) && ccType(entry) === "turbolora");
+                    if (!turboEntries.length && mode !== "illustrious") {
+                        const fallbackName = mode === "qi2" ? QI2_TURBO_LORA_NAME : ANIMA_TURBO_LORA_NAME;
+                        const fallback = {
+                            name: mode === "qi2" ? "Qwen Image 2.1 Viggle Turbo" : "Anima Turbo LoRA",
+                            type: "turbolora",
+                            kind: mode === "qi2" ? "QI2" : "Anima",
+                            local_path: `models/loras/${fallbackName}`,
+                            status: (localAssets.loras || []).map(x => String(x).replace(/\\/g, "/")).includes(fallbackName.replace(/\\/g, "/")) ? "installed" : "missing",
+                            description: mode === "qi2" ? "Six-step Viggle Turbo LoRA for Qwen Image 2.1." : "Anima turbo LoRA.",
+                        };
+                        turboEntries.push(fallback);
+                    }
+
+                    const label = document.createElement("div");
+                    label.className = "ems-label";
+                    label.textContent = "Turbo LoRA";
+                    containerEl.appendChild(label);
+                    turboEntries.forEach(entry => {
+                        const rel = ccRelPath(entry);
+                        const status = ccResolveStatus(entry, "lora");
+                        const installed = status === "installed";
+                        const progress = ["queued", "downloading"].includes(status);
+                        const enabled = mode === "anima" || mode === "qi2"
+                            ? !!state.gen.turbo_enabled && String(state.gen.dmd_lora_name || "").replace(/\\/g, "/") === rel
+                            : (state.gen.dmd_lora_strength || 0) > 0 && String(state.gen.dmd_lora_name || "").replace(/\\/g, "/") === rel;
+                        const card = document.createElement("div");
+                        card.className = "ems-lora-card" + (installed && enabled ? " is-selected" : "");
+                        if (installed) {
+                            card.onclick = () => setCcTurboMode(!enabled, rel);
+                        }
+
+                        const name = document.createElement("div");
+                        name.className = "ems-lora-name";
+                        const dot = document.createElement("span");
+                        dot.className = "ems-model-dot " + (installed ? "ok" : progress ? "progress" : "missing");
+                        name.appendChild(dot);
+                        name.appendChild(document.createTextNode(entry.name || rel || "Turbo LoRA"));
+
+                        const statusEl = document.createElement("div");
+                        statusEl.className = "ems-model-status " + (installed ? "ok" : progress ? "progress" : "missing");
+                        statusEl.textContent = cardStatusLabel(status, entry, "lora");
+
+                        card.appendChild(name);
+                        card.appendChild(statusEl);
+
+                        if (installed) {
+                            const toggle = document.createElement("label");
+                            toggle.className = "ems-toggle";
+                            toggle.onclick = (event) => event.stopPropagation();
+                            const input = document.createElement("input");
+                            input.type = "checkbox";
+                            input.checked = enabled;
+                            input.ariaLabel = `Enable ${entry.name || rel}`;
+                            card.dataset.toggleState = String(enabled);
+                            card.dataset.focusKey = `turbo-${mode}-${rel}`;
+                            input.dataset.focusKey = `${card.dataset.focusKey}-toggle`;
+                            input.onchange = (event) => {
+                                event.stopPropagation();
+                                setCcTurboMode(event.target.checked, rel);
+                            };
+                            const track = document.createElement("span");
+                            track.className = "ems-toggle-track vnccs-common-ui-toggle-track";
+                            const thumb = document.createElement("span");
+                            thumb.className = "ems-toggle-thumb vnccs-common-ui-toggle-thumb";
+                            toggle.append(input, track, thumb);
+                            card.appendChild(toggle);
+                        } else {
+                            const btn = document.createElement("button");
+                            btn.type = "button";
+                            btn.className = "ems-model-card-download";
+                            btn.textContent = status === "auth_required" ? "Enter Key" : "Download";
+                            btn.disabled = progress;
+                            btn.onclick = (event) => {
+                                event.stopPropagation();
+                                if (!progress && status !== "auth_required") ccDownloadEntry("lora", entry);
+                            };
+                            card.appendChild(btn);
+                        }
+
+                        containerEl.appendChild(card);
+                    });
+                };
+
+                const renderControlCenterCards = () => {
+                    if (!generationEls.animaModelCards || !generationEls.illustriousModelCards || !generationEls.qi2ModelCards) return;
+                    const view = ui?.captureView();
+                    const currentMode = (state.gen.generation_mode || "anima").toLowerCase();
+                    const isAnimaMode = currentMode === "anima";
+                    const isQi2Mode = currentMode === "qi2";
+
+                    const animaModels = mergeCcAndLocalEntries(
+                        ccEntries("models", "Anima", entry => ccType(entry) === "unet"),
+                        localAssets.diffusion_models,
+                        "diffusion_models",
+                        "unet",
+                        "Anima",
+                    );
+                    renderModelPicker({
+                        containerEl: generationEls.animaModelCards,
+                        entries: animaModels,
+                        cat: "models",
+                        key: "diffusion_model_name",
+                        mode: "anima",
+                        emptyText: "No Anima diffusion models found.",
+                        onSelect: rel => selectAnimaModel(rel),
+                        onDownload: downloadAnimaBundle,
+                    });
+                    const currentAnima = String(state.gen.diffusion_model_name || "").replace(/\\/g, "/");
+                    if (isAnimaMode && !currentAnima && animaModels[0]) selectAnimaModel(ccRelPath(animaModels[0]));
+                    if (isAnimaMode) ensureAnimaDefaultAux();
+
+                    const qi2Models = mergeCcAndLocalEntries(
+                        ccEntries("models", "QI2", entry => ccType(entry) === "unet"),
+                        localAssets.diffusion_models,
+                        "diffusion_models",
+                        "unet",
+                        "QI2",
+                    );
+                    renderModelPicker({
+                        containerEl: generationEls.qi2ModelCards,
+                        entries: qi2Models,
+                        cat: "models",
+                        key: "diffusion_model_name",
+                        mode: "qi2",
+                        emptyText: "No Qwen Image 2.1 diffusion models found.",
+                        onSelect: rel => selectQi2Model(rel),
+                        onDownload: downloadQi2Bundle,
+                    });
+                    const currentQi2 = String(state.gen.diffusion_model_name || "").replace(/\\/g, "/");
+                    if (isQi2Mode && !currentQi2 && qi2Models[0]) selectQi2Model(ccRelPath(qi2Models[0]));
+                    if (isQi2Mode) ensureQi2DefaultAux();
+
+                    const illustriousDefaults = (ccState.config?.models || []).filter(entry => {
+                        const kind = ccKind(entry);
+                        return (kind === "illustrious" || kind === "sdxl") && ccType(entry) === "checkpoint";
+                    });
+                    const illustriousCkpts = mergeCcAndLocalEntries(
+                        illustriousDefaults,
+                        localAssets.checkpoints,
+                        "checkpoints",
+                        "checkpoint",
+                        "Illustrious",
+                    );
+                    renderModelPicker({
+                        containerEl: generationEls.illustriousModelCards,
+                        entries: illustriousCkpts,
+                        cat: "models",
+                        key: "ckpt_name",
+                        mode: "illustrious",
+                        emptyText: "No Illustrious checkpoints found.",
+                        onSelect: rel => selectIllustriousModel(rel),
+                    });
+                    const currentIllustrious = String(state.gen.ckpt_name || "").replace(/\\/g, "/");
+                    if (currentMode === "illustrious" && !currentIllustrious && illustriousCkpts[0]) selectCcAsset("ckpt_name", ccRelPath(illustriousCkpts[0]));
+
+                    generationEls.animaModelCards.style.display = isAnimaMode ? "flex" : "none";
+                    generationEls.qi2ModelCards.style.display = isQi2Mode ? "flex" : "none";
+                    generationEls.illustriousModelCards.style.display = currentMode === "illustrious" ? "flex" : "none";
+                    if (generationEls.animaLoraCards) renderModeLoraCards(generationEls.animaLoraCards, currentMode);
+                    ui?.syncSelects();
+                    if (view) ui.restoreView(view);
+                };
+
+                function populateSelect(select, values, includeNone = false) {
+                    const current = select.value;
+                    select.innerHTML = "";
+                    if (includeNone) {
+                        const opt = document.createElement("option");
+                        opt.value = "";
+                        opt.innerText = "None";
+                        select.appendChild(opt);
+                    }
+                    (values || []).forEach(value => {
+                        if (value === "") return;
+                        const opt = document.createElement("option");
+                        opt.value = value;
+                        opt.innerText = value;
+                        select.appendChild(opt);
+                    });
+                    if ([...select.options].some(opt => opt.value === current)) {
+                        select.value = current;
+                    }
+                }
+
+                async function loadGenerationAssets() {
+                    if (disposed) return;
+                    try {
+                        const response = await api.fetchApi("/vnccs/context_lists");
+                        if (!response.ok) return;
+                        const data = await response.json();
+                        if (disposed) return;
+                        localAssets = {
+                            checkpoints: data.checkpoints || [],
+                            diffusion_models: data.diffusion_models || [],
+                            text_encoders: data.text_encoders || [],
+                            vae_models: data.vae_models || [],
+                            loras: data.loras || [],
+                        };
+                        populateSelect(generationEls.sampler, data.samplers || ["euler", "er_sde"]);
+                        populateSelect(generationEls.scheduler, data.schedulers || ["normal", "simple"]);
+                        (generationEls.loraSelects || []).forEach(select => populateSelect(select, data.loras || [], true));
+
+                        if (!state.gen.ckpt_name && data.checkpoints?.length) state.gen.ckpt_name = data.checkpoints[0];
+                        if (!state.gen.diffusion_model_name && data.diffusion_models?.length) state.gen.diffusion_model_name = data.diffusion_models[0];
+                        if (!state.gen.clip_name) {
+                            state.gen.clip_name = (data.text_encoders || []).includes(ANIMA_CLIP_NAME) ? ANIMA_CLIP_NAME : (data.text_encoders?.[0] || ANIMA_CLIP_NAME);
+                        }
+                        if (!state.gen.vae_name) {
+                            state.gen.vae_name = (data.vae_models || []).includes(ANIMA_VAE_NAME) ? ANIMA_VAE_NAME : (data.vae_models?.[0] || ANIMA_VAE_NAME);
+                        }
+                        syncGenerationControls();
+                        saveGenerationSettings();
+                        try {
+                            await fetchCcConfig(false);
+                        } catch (error) {
+                            if (disposed) return;
+                            console.warn("[VNCCS Emotion Studio] Failed to load Control Center config", error);
+                            renderControlCenterCards();
+                        }
+                    } catch (e) {
+                        console.warn("[VNCCS Emotion Studio] Failed to load generation asset lists", e);
+                    }
+                }
+
+                function syncGenerationControls() {
+                    const view = ui?.captureView();
+                    const mode = (state.gen.generation_mode || "anima").toLowerCase();
+                    generationEls.tabIllustrious?.classList.toggle("active", mode === "illustrious");
+                    generationEls.tabAnima?.classList.toggle("active", mode === "anima");
+                    generationEls.tabQi2?.classList.toggle("active", mode === "qi2");
+                    ui?.syncSelection(generationEls.tabQi2?.parentElement);
+                    if (generationEls.animaModelCards) generationEls.animaModelCards.style.display = mode === "anima" ? "flex" : "none";
+                    if (generationEls.qi2ModelCards) generationEls.qi2ModelCards.style.display = mode === "qi2" ? "flex" : "none";
+                    if (generationEls.illustriousModelCards) generationEls.illustriousModelCards.style.display = mode === "illustrious" ? "flex" : "none";
+                    if (generationEls.steps) generationEls.steps.value = state.gen.steps ?? "";
+                    if (generationEls.cfg) generationEls.cfg.value = state.gen.cfg ?? "";
+                    if (generationEls.sampler) generationEls.sampler.value = state.gen.sampler || "euler";
+                    if (generationEls.scheduler) generationEls.scheduler.value = state.gen.scheduler || "normal";
+                    if (generationEls.seed) generationEls.seed.value = state.gen.seed ?? 0;
+                    if (generationEls.seedMode) {
+                        const randomize = (state.gen.seed_mode || "fixed") === "randomize";
+                        generationEls.seedMode.classList.toggle("active", randomize);
+                        generationEls.seedMode.title = randomize ? "Random seed on queue" : "Fixed seed";
+                        generationEls.seedMode.setAttribute("aria-pressed", randomize ? "true" : "false");
+                    }
+                    if (generationEls.qi2Cache) generationEls.qi2Cache.style.display = mode === "qi2" ? "grid" : "none";
+                    if (generationEls.qi2CacheDevice) generationEls.qi2CacheDevice.value = state.gen.qi2_cache?.device || "gpu";
+                    if (generationEls.qi2CacheDtype) generationEls.qi2CacheDtype.value = state.gen.qi2_cache?.dtype || "int8";
+                    if (generationEls.loraHeader) generationEls.loraHeader.innerText = mode === "qi2" ? "Qwen Image 2.1 LoRA Stack" : mode === "anima" ? "Anima LoRA Stack" : "Illustrious LoRA Stack";
+                    if (generationEls.loraSection) generationEls.loraSection.style.display = "flex";
+                    if (generationEls.animaLoraCards) renderModeLoraCards(generationEls.animaLoraCards, mode);
+                    if (generationEls.loraRows) {
+                        generationEls.loraRows.forEach((row, index) => {
+                            const item = (state.gen.lora_stack || [])[index] || { name: "", strength: 1.0 };
+                            const name = item.name || "";
+                            if (row.name && ![...row.name.options].some(opt => opt.value === name)) {
+                                const opt = document.createElement("option");
+                                opt.value = name;
+                                opt.innerText = name || "None";
+                                row.name.appendChild(opt);
+                            }
+                            if (row.name) row.name.value = name || "";
+                            if (row.strength) row.strength.value = item.strength ?? 1;
+                        });
+                    }
+                    if (ccState.config) renderControlCenterCards();
+                    ui?.syncSelects();
+                    if (view) ui.restoreView(view);
+                }
+
+                // Create UI Container
+                const container = document.createElement("div");
+                container.className = "ems-container";
+                container.classList.add("vnccs-common-ui-host");
+                ui = createSakuraInteractions(container, node);
+                registerCleanup(node, () => ui.dispose());
+
+                // --- LEFT COL ---
+                const leftCol = document.createElement("div");
+                leftCol.className = "ems-left-col";
+
+                // Character Header
+                const charSection = document.createElement("div");
+                charSection.className = "ems-section";
+                charSection.style.flex = "1";
+
+                const charHeader = document.createElement("div");
+                charHeader.className = "ems-char-header";
+                charHeader.innerText = "Character select";
+
+                const previewContainer = document.createElement("div");
+                previewContainer.className = "ems-char-preview-container";
+                previewContainer.classList.add("vnccs-common-ui-preview-host");
+                const previewAura = document.createElement("div");
+                previewAura.className = "vnccs-common-ui-preview-aura";
+                previewContainer.appendChild(previewAura);
+
+                const charImg = document.createElement("img");
+                charImg.className = "ems-char-preview";
+                charImg.style.display = "none";
+                previewContainer.appendChild(charImg);
+
+                const charPlaceholder = document.createElement("div");
+                charPlaceholder.style.cssText = "display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;color:rgba(255,143,163,0.35);pointer-events:none;";
+                charPlaceholder.innerHTML = `
+                    <svg width="52" height="52" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <circle cx="12" cy="7" r="4" stroke="#ff8fa3" stroke-width="1.5"/>
+                        <path d="M4 20c0-4 3.582-7 8-7s8 3 8 7" stroke="#ff8fa3" stroke-width="1.5" stroke-linecap="round"/>
+                    </svg>
+                    <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;font-family:'Sora',sans-serif;">Character</div>
+                `;
+                previewContainer.appendChild(charPlaceholder);
+                const charPreviewLoading = document.createElement("div");
+                charPreviewLoading.className = "ems-char-preview-loading";
+                previewContainer.appendChild(charPreviewLoading);
+
+                // Show/hide placeholder when image loads
+                charImg.onload = () => { charImg.style.display = "block"; charPlaceholder.style.display = "none"; };
+                charImg.onerror = () => { charImg.style.display = "none"; charPlaceholder.style.display = "flex"; };
+
+                charSection.appendChild(charHeader);
+                charSection.appendChild(previewContainer);
+                const spriteNav = document.createElement("div");
+                spriteNav.className = "ems-sprite-nav";
+                const spritePrevBtn = document.createElement("button");
+                spritePrevBtn.type = "button";
+                spritePrevBtn.className = "ems-sprite-nav-btn";
+                spritePrevBtn.title = "Previous sprite";
+                spritePrevBtn.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg>';
+                const spriteCount = document.createElement("div");
+                spriteCount.className = "ems-sprite-nav-count";
+                const spriteNextBtn = document.createElement("button");
+                spriteNextBtn.type = "button";
+                spriteNextBtn.className = "ems-sprite-nav-btn";
+                spriteNextBtn.title = "Next sprite";
+                spriteNextBtn.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>';
+                spriteNav.append(spritePrevBtn, spriteCount, spriteNextBtn);
+                charSection.appendChild(spriteNav);
+
+                const poseSelection = document.createElement("div");
+                poseSelection.className = "ems-pose-selection";
+                const poseSelectionHeader = document.createElement("div");
+                poseSelectionHeader.className = "ems-pose-selection-header";
+                const poseSelectionTitle = document.createElement("div");
+                poseSelectionTitle.className = "ems-pose-selection-title";
+                poseSelectionTitle.textContent = "Generate poses";
+                poseSelectionSummary = document.createElement("div");
+                poseSelectionSummary.className = "ems-pose-selection-summary";
+                poseSelectionSummary.textContent = "Loading...";
+                poseSelectionHeader.append(poseSelectionTitle, poseSelectionSummary);
+                poseSelectionGrid = document.createElement("div");
+                poseSelectionGrid.className = "ems-pose-grid";
+                const poseSelectionActions = document.createElement("div");
+                poseSelectionActions.className = "ems-pose-selection-actions";
+                const selectAllPoses = document.createElement("button");
+                selectAllPoses.type = "button";
+                selectAllPoses.className = "ems-pose-selection-action";
+                selectAllPoses.textContent = "SELECT ALL";
+                selectAllPoses.onclick = () => {
+                    state.selectedPoseIndices = null;
+                    saveGenerationSettings();
+                    renderPoseSelection();
+                };
+                const clearAllPoses = document.createElement("button");
+                clearAllPoses.type = "button";
+                clearAllPoses.className = "ems-pose-selection-action";
+                clearAllPoses.textContent = "CLEAR ALL";
+                clearAllPoses.onclick = () => {
+                    state.selectedPoseIndices = new Set();
+                    saveGenerationSettings();
+                    renderPoseSelection();
+                };
+                poseSelectionActions.append(selectAllPoses, clearAllPoses);
+                poseSelection.append(poseSelectionHeader, poseSelectionGrid, poseSelectionActions);
+                charSection.appendChild(poseSelection);
+
+                spritePreviewNavigator = createSpritePreviewNavigator({
+                    node,
+                    isSelectionCurrent: preview => !disposed && preview.character === state.character,
+                    image: charImg,
+                    interactions: ui,
+                    placeholder: charPlaceholder,
+                    loading: charPreviewLoading,
+                    nav: spriteNav,
+                    prevButton: spritePrevBtn,
+                    nextButton: spriteNextBtn,
+                    countLabel: spriteCount,
+                    onLoaded: (_url, previewState) => {
+                        state.poseCount = Math.max(0, Number(previewState.count || 0));
+                        if (state.selectedPoseIndices !== null) {
+                            state.selectedPoseIndices = new Set(selectedPoseIndexList());
+                        }
+                        state.selectedPreviewSprite = previewState.count > 0
+                            ? {
+                                character: previewState.character,
+                                costume: previewState.costume || "",
+                                index: previewState.index,
+                                count: previewState.count,
+                            }
+                            : null;
+                        state.gen.selected_preview_sprite = state.selectedPreviewSprite;
+                        saveGenerationSettings(false);
+                        renderPoseSelection();
+                    },
+                    onMissing: () => {
+                        state.poseCount = 0;
+                        state.selectedPreviewSprite = null;
+                        delete state.gen.selected_preview_sprite;
+                        saveGenerationSettings(false);
+                        renderPoseSelection();
+                    },
+                });
+                leftCol.appendChild(charSection);
+
+                container.appendChild(leftCol);
+
+                // --- RIGHT COL ---
+                const rightCol = document.createElement("div");
+                rightCol.className = "ems-right-col";
+
+                const selectionCol = document.createElement("div");
+                selectionCol.className = "ems-selection-col";
+
+                // Costumes
+                const costumesSection = document.createElement("div");
+                costumesSection.className = "ems-section";
+
+                const costumesHeader = document.createElement("div");
+                costumesHeader.className = "ems-costumes-header";
+                costumesHeader.innerText = "Selected costumes";
+                costumesSection.appendChild(costumesHeader);
+
+                const costumesList = document.createElement("div");
+                costumesList.className = "ems-costumes-list";
+                costumesList.dataset.sakuraScroll = "costumes";
+                costumesSection.appendChild(costumesList);
+
+                selectionCol.appendChild(costumesSection);
+
+                // Emotions
+                const emotionsSection = document.createElement("div");
+                emotionsSection.className = "ems-section";
+                emotionsSection.style.flex = "1";
+
+                const selectedEmotionsWrap = document.createElement("div");
+                selectedEmotionsWrap.className = "ems-selected-emotions-wrap";
+                const selectedEmotionsHeader = document.createElement("div");
+                selectedEmotionsHeader.className = "ems-selected-emotions-header";
+                selectedEmotionsHeader.innerText = "Selected emotions";
+                const selectedEmotionsList = document.createElement("div");
+                selectedEmotionsList.className = "ems-selected-emotions-list";
+                selectedEmotionsList.dataset.sakuraScroll = "selected-emotions";
+                selectedEmotionsWrap.appendChild(selectedEmotionsHeader);
+                selectedEmotionsWrap.appendChild(selectedEmotionsList);
+                emotionsSection.appendChild(selectedEmotionsWrap);
+
+                const emotionsGrid = document.createElement("div");
+                emotionsGrid.className = "ems-emotions-container";
+                emotionsGrid.dataset.sakuraScroll = "emotions";
+                emotionsSection.appendChild(emotionsGrid);
+
+                // Search Input
+                const searchInput = document.createElement("input");
+                searchInput.className = "ems-search-input";
+                searchInput.placeholder = "Search emotions (name or description)...";
+                searchInput.oninput = (e) => {
+                    state.searchTerm = e.target.value;
+                    renderEmotions();
+                    updateButtonState();
+                };
+                emotionsSection.appendChild(searchInput);
+
+                // Footer (Select All)
+                const footer = document.createElement("div");
+                footer.className = "ems-footer";
+                const btnAll = document.createElement("button");
+                btnAll.className = "ems-btn";
+                btnAll.innerText = "Select ALL";
+                footer.appendChild(btnAll);
+                emotionsSection.appendChild(footer);
+
+                selectionCol.appendChild(emotionsSection);
+
+                const generationSection = document.createElement("div");
+                generationSection.className = "ems-section ems-generation-section";
+                generationSection.dataset.sakuraScroll = "generation";
+
+                const generationHeader = document.createElement("div");
+                generationHeader.className = "ems-costumes-header";
+                generationHeader.innerText = "Generation";
+                generationSection.appendChild(generationHeader);
+
+                const tabRow = document.createElement("div");
+                tabRow.className = "ems-tab-row";
+                tabRow.setAttribute("role", "group");
+                tabRow.setAttribute("aria-label", "Generation mode");
+                const tabIllustrious = document.createElement("button");
+                tabIllustrious.type = "button";
+                tabIllustrious.className = "ems-tab";
+                tabIllustrious.innerText = "Illustrious";
+                tabIllustrious.onclick = () => setGenerationMode("illustrious");
+                const tabAnima = document.createElement("button");
+                tabAnima.type = "button";
+                tabAnima.className = "ems-tab";
+                tabAnima.innerText = "Anima";
+                tabAnima.onclick = () => setGenerationMode("anima");
+                const tabQi2 = document.createElement("button");
+                tabQi2.type = "button";
+                tabQi2.className = "ems-tab";
+                tabQi2.innerText = "Qwen Image 2.1";
+                tabQi2.onclick = () => setGenerationMode("qi2");
+                generationEls.tabIllustrious = tabIllustrious;
+                generationEls.tabAnima = tabAnima;
+                generationEls.tabQi2 = tabQi2;
+                tabRow.appendChild(tabQi2);
+                tabRow.appendChild(tabAnima);
+                tabRow.appendChild(tabIllustrious);
+                generationSection.appendChild(tabRow);
+
+                const illustriousModelCards = document.createElement("div");
+                illustriousModelCards.className = "ems-model-card-list";
+                generationEls.illustriousModelCards = illustriousModelCards;
+                generationSection.appendChild(illustriousModelCards);
+
+                const animaModelCards = document.createElement("div");
+                animaModelCards.className = "ems-model-card-list";
+                generationEls.animaModelCards = animaModelCards;
+                generationSection.appendChild(animaModelCards);
+
+                const qi2ModelCards = document.createElement("div");
+                qi2ModelCards.className = "ems-model-card-list";
+                generationEls.qi2ModelCards = qi2ModelCards;
+                generationSection.appendChild(qi2ModelCards);
+
+                const genGrid = document.createElement("div");
+                genGrid.className = "ems-generation-grid";
+                generationEls.steps = createNumberInput("steps", 1, 100, 1);
+                generationEls.sampler = createSelectInput("sampler", ["euler", "er_sde", "dpmpp_2m", "dpmpp_sde", "dpmpp_3m_sde"]);
+                generationEls.cfg = createNumberInput("cfg", 0, 20, 0.1);
+                generationEls.scheduler = createSelectInput("scheduler", ["normal", "simple", "karras", "exponential", "sgm_uniform"]);
+                genGrid.appendChild(createField("Steps", generationEls.steps, "steps"));
+                genGrid.appendChild(createField("Sampler", generationEls.sampler, "sampler"));
+                genGrid.appendChild(createField("CFG", generationEls.cfg, "cfg"));
+                genGrid.appendChild(createField("Scheduler", generationEls.scheduler, "scheduler"));
+                generationSection.appendChild(genGrid);
+
+                const qi2Cache = document.createElement("div");
+                qi2Cache.className = "ems-qi2-cache";
+                const qi2CacheTitle = document.createElement("div");
+                qi2CacheTitle.className = "ems-qi2-cache-title";
+                qi2CacheTitle.innerText = "Qwen Image 2.1 Cache";
+                const qi2CacheDevice = createSelectInput("qi2_cache_device", ["auto", "gpu", "cpu", "off"]);
+                const qi2CacheDtype = createSelectInput("qi2_cache_dtype", ["default", "int8", "int4"]);
+                qi2CacheDevice.onchange = () => {
+                    state.gen.qi2_cache = { ...(state.gen.qi2_cache || {}), device: qi2CacheDevice.value };
+                    saveGenerationSettings();
+                };
+                qi2CacheDtype.onchange = () => {
+                    state.gen.qi2_cache = { ...(state.gen.qi2_cache || {}), dtype: qi2CacheDtype.value };
+                    saveGenerationSettings();
+                };
+                qi2Cache.appendChild(qi2CacheTitle);
+                qi2Cache.appendChild(createField("Device", qi2CacheDevice));
+                qi2Cache.appendChild(createField("Dtype", qi2CacheDtype));
+                generationEls.qi2Cache = qi2Cache;
+                generationEls.qi2CacheDevice = qi2CacheDevice;
+                generationEls.qi2CacheDtype = qi2CacheDtype;
+
+                const seedInput = createNumberInput("seed", undefined, undefined, 1);
+                const seedDice = document.createElement("button");
+                seedDice.type = "button";
+                seedDice.className = "ems-seed-dice";
+                setHelpText(seedDice, helpFor("seed_mode"));
+                seedDice.innerHTML = `<svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                    <rect x="4" y="4" width="16" height="16" rx="3.5" stroke="currentColor" stroke-width="2"/>
+                    <circle cx="8.5" cy="8.5" r="1.4" fill="currentColor"/>
+                    <circle cx="15.5" cy="8.5" r="1.4" fill="currentColor"/>
+                    <circle cx="12" cy="12" r="1.4" fill="currentColor"/>
+                    <circle cx="8.5" cy="15.5" r="1.4" fill="currentColor"/>
+                    <circle cx="15.5" cy="15.5" r="1.4" fill="currentColor"/>
+                </svg>`;
+                seedDice.onclick = () => {
+                    state.gen.seed_mode = (state.gen.seed_mode || "fixed") === "randomize" ? "fixed" : "randomize";
+                    syncGenerationControls();
+                    saveGenerationSettings();
+                };
+                const seedRow = document.createElement("div");
+                seedRow.className = "ems-seed-row";
+                seedRow.appendChild(seedInput);
+                seedRow.appendChild(seedDice);
+                generationEls.seed = seedInput;
+                generationEls.seedMode = seedDice;
+                generationSection.appendChild(createField("Seed", seedRow, "seed"));
+                generationSection.appendChild(qi2Cache);
+
+                const loraSection = document.createElement("div");
+                loraSection.className = "ems-lora-stack";
+                generationEls.loraSelects = [];
+                generationEls.loraRows = [];
+                const loraHeader = document.createElement("div");
+                loraHeader.className = "ems-costumes-header";
+                loraHeader.innerText = "Anima LoRA Stack";
+                generationEls.loraHeader = loraHeader;
+                loraSection.appendChild(loraHeader);
+                const animaLoraCards = document.createElement("div");
+                animaLoraCards.className = "ems-lora-stack";
+                generationEls.animaLoraCards = animaLoraCards;
+                loraSection.appendChild(animaLoraCards);
+                for (let i = 0; i < 5; i++) {
+                    const row = document.createElement("div");
+                    row.className = "ems-lora-row";
+                    setHelpText(row, helpFor("lora_stack"));
+                    const name = createSelectInput(`lora_${i}`, ["", "None"]);
+                    const strength = createNumberInput(`lora_strength_${i}`, 0, 2, 0.05, value => {
+                        state.gen.lora_stack = state.gen.lora_stack || [];
+                        state.gen.lora_stack[i] = state.gen.lora_stack[i] || { name: "", strength: 1.0 };
+                        state.gen.lora_stack[i].strength = value;
+                        saveGenerationSettings();
+                    });
+                    setHelpText(strength, helpFor("lora_strength"));
+                    name.onchange = () => {
+                        state.gen.lora_stack = state.gen.lora_stack || [];
+                        state.gen.lora_stack[i] = state.gen.lora_stack[i] || { name: "", strength: 1.0 };
+                        state.gen.lora_stack[i].name = name.value === "None" ? "" : name.value;
+                        saveGenerationSettings();
+                    };
+                    name.value = "None";
+                    strength.value = "1";
+                    generationEls.loraSelects.push(name);
+                    generationEls.loraRows.push({ name, strength });
+                    row.appendChild(name);
+                    row.appendChild(strength);
+                    loraSection.appendChild(row);
+                }
+                generationEls.loraSection = loraSection;
+                generationSection.appendChild(loraSection);
+
+                rightCol.appendChild(selectionCol);
+                rightCol.appendChild(generationSection);
+                syncGenerationControls();
+                loadGenerationAssets();
+                container.appendChild(rightCol);
+
+                // Custom Select in Header
+                const charSelect = document.createElement("select");
+                charSelect.className = "em-select";
+                charSelect.ariaLabel = "Character";
+
+                charHeader.appendChild(charSelect);
+
+                const setCharacterOptions = (characters, preferred = "") => {
+                    if (!Array.isArray(characters)) throw new Error("Invalid character list.");
+                    const previous = preferred || state.character || charWidget?.value || charSelect.value || "";
+                    const values = characters.filter(Boolean);
+                    charSelect.innerHTML = "";
+                    if (charWidget) charWidget.options.values = values;
+                    if (!values.length) {
+                        charSelect.appendChild(new Option("No characters", ""));
+                        charSelect.value = "";
+                        state.character = "";
+                        spritePreviewNavigator?.hideNav();
+                        if (charWidget) commitWidget(charWidget, "", false);
+                        return "";
+                    }
+                    values.forEach(name => charSelect.appendChild(new Option(name, name)));
+                    const selected = values.includes(previous) ? previous : values[0];
+                    charSelect.value = selected;
+                    state.character = selected;
+                    if (charWidget) {
+                        if (charWidget.value !== selected) commitWidget(charWidget, selected, false);
+                    }
+                    return selected;
+                };
+
+                let characterListRefreshToken = 0;
+                const refreshCharacterList = async ({ fetchData = false } = {}) => {
+                    if (disposed) return;
+                    const token = ++characterListRefreshToken;
+                    try {
+                        const response = await api.fetchApi("/vnccs/list_characters", { cache: "no-store" });
+                        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                        const characters = await response.json();
+                        if (disposed || token !== characterListRefreshToken) return;
+                        const before = state.character || charSelect.value || "";
+                        const selected = setCharacterOptions(characters, before);
+                        if (selected !== before) {
+                            resetSelectedEmotionsForCharacterChange();
+                            state.costumes = [];
+                            state.selectedCostumes = new Set();
+                            renderCostumes();
+                            updateCostumesData();
+                        }
+                        if (selected && (fetchData || selected !== before)) {
+                            fetchCharacterData(selected);
+                        } else if (!selected) {
+                            spritePreviewNavigator?.load("");
+                        }
+                    } catch (error) {
+                        console.error("[VNCCS Emotion Studio] Failed to refresh character list", error);
+                    }
+                };
+
+                if (charWidget) {
+                    if (charWidget.options.values) {
+                        charWidget.options.values.forEach(v => {
+                            const opt = document.createElement("option");
+                            opt.value = v;
+                            opt.innerText = v;
+                            if (v === charWidget.value) opt.selected = true;
+                            charSelect.appendChild(opt);
+                        });
+                    }
+                    charSelect.onchange = () => {
+                        const previousCharacter = state.character;
+                        state.character = charSelect.value;
+                        commitWidget(charWidget, charSelect.value, false);
+                        if (charSelect.value !== previousCharacter) {
+                            resetSelectedEmotionsForCharacterChange();
+                        }
+                        fetchCharacterData(charSelect.value);
+                    };
+                    charWidget.hidden = true;
+                }
+                charSelect.onfocus = () => refreshCharacterList();
+                charSelect.onpointerdown = () => refreshCharacterList();
+
+                const onCharactersUpdated = () => refreshCharacterList({ fetchData: true });
+                window.addEventListener("vnccs.characters.updated", onCharactersUpdated);
+                registerCleanup(node, () => {
+                    stopCcPolling();
+                    window.removeEventListener("vnccs.characters.updated", onCharactersUpdated);
+                });
+
+                const styleWidget = node.widgets.find(w => w.name === "prompt_style");
+                if (styleWidget) {
+                    styleWidget.hidden = true;
+                    commitWidget(styleWidget, promptStyleForMode(state.gen.generation_mode), false);
+                }
+
+
+                enableMiddleMouseCanvasPan(container);
+                attachHelpTooltips(container);
+                const widget = node.addDOMWidget("emotion_ui_v2", "ui", container, {
+                    serialize: false,
+                    hideOnZoom: false,
+                    getValue() { return undefined; },
+                    setValue(v) { }
+                });
+                syncDOMWidgetWidthSoon(node, "emotion_ui_v2");
+
+                const origSerialize = node.onSerialize;
+                node.onSerialize = function(info) {
+                    persistAllState();
+                    const result = origSerialize?.apply(this, arguments);
+                    if (Array.isArray(info?.widgets_values)) {
+                        for (const widget of [modelWidget, generationSettingsWidget, styleWidget, charWidget, costumesDataWidget, emotionsDataWidget]) {
+                            const index = this.widgets.indexOf(widget);
+                            if (index >= 0) info.widgets_values[index] = widget.value;
+                        }
+                    }
+                    return result;
+                };
+
+                // Fix layout after tab switch: ComfyUI detaches/reattaches DOM widgets
+                // without triggering onResize. Use ResizeObserver on the node's canvas
+                // element to detect when the widget becomes visible again and reapply sizes.
+                function applySize() {
+                    const [w, h] = node.size;
+                    container.style.width = (w - 20) + "px";
+                    container.style.height = (h - 60) + "px";
+                }
+
+                const origDraw = node.onDrawBackground;
+                node.onDrawBackground = function (ctx) {
+                    applySize();
+                    if (origDraw) origDraw.apply(this, arguments);
+                };
+
+                function showModalText(title, message, onConfirm = null) {
+                    const buttons = onConfirm ? [{ text: "Cancel" }] : [];
+                    buttons.push({ text: onConfirm ? "Proceed" : "OK", autofocus: true, action: overlay => {
+                        overlay.remove();
+                        onConfirm?.();
+                    } });
+                    const dialog = showCommonModal(container, String(title ?? ""), () => {
+                        const text = document.createElement("div");
+                        text.className = "ems-modal-text";
+                        const heading = document.createElement("strong");
+                        heading.textContent = String(title ?? "");
+                        const body = document.createElement("div");
+                        body.textContent = String(message ?? "");
+                        body.style.whiteSpace = "pre-wrap";
+                        text.append(heading, document.createElement("br"), body);
+                        return text;
+                    }, buttons);
+                    dialog.overlay.className = "ems-modal-backdrop";
+                    dialog.modal.className = "ems-modal";
+                    dialog.title.hidden = true;
+                    dialog.actions.className = "ems-modal-actions";
+                    dialog.buttons.forEach((button, index) => {
+                        button.className = `ems-modal-btn ems-modal-btn--${onConfirm && index === 0 ? "cancel" : "confirm"}`;
+                    });
+                }
+
+                function createCustomEmotionField(labelText, inputEl) {
+                    const field = document.createElement("label");
+                    field.className = "ems-field";
+
+                    const label = document.createElement("span");
+                    label.className = "ems-label";
+                    label.innerText = labelText;
+
+                    field.appendChild(label);
+                    field.appendChild(inputEl);
+                    return field;
+                }
+
+                function showCustomEmotionModal() {
+                    const requestIsCurrent = beginSelectionRequest();
+                    const character = state.character;
+                    const backdrop = document.createElement("div");
+                    backdrop.className = "ems-modal-backdrop";
+                    const isCurrent = () => requestIsCurrent() && state.character === character && backdrop.isConnected;
+
+                    const modal = document.createElement("div");
+                    modal.className = "ems-modal ems-modal--custom-emotion";
+
+                    const text = document.createElement("div");
+                    text.className = "ems-modal-text";
+                    const titleEl = document.createElement("strong");
+                    titleEl.textContent = "Add Custom Emotion";
+                    text.appendChild(titleEl);
+
+                    const form = document.createElement("div");
+                    form.className = "ems-custom-form";
+
+                    const nameInput = document.createElement("input");
+                    nameInput.className = "ems-input";
+                    nameInput.type = "text";
+                    nameInput.placeholder = "Emotion name";
+
+                    const tagsInput = document.createElement("textarea");
+                    tagsInput.className = "ems-input";
+                    tagsInput.placeholder = "angry, furrowed_brow, open_mouth";
+
+                    const promptInput = document.createElement("textarea");
+                    promptInput.className = "ems-input";
+                    promptInput.placeholder = "The character looks...";
+
+                    const imageRow = document.createElement("div");
+                    imageRow.className = "ems-custom-image-row";
+
+                    let previewEl = document.createElement("div");
+                    previewEl.className = "ems-custom-preview is-empty";
+                    previewEl.innerText = "+";
+
+                    const fileInput = document.createElement("input");
+                    fileInput.className = "ems-custom-file";
+                    fileInput.type = "file";
+                    fileInput.accept = "image/*";
+
+                    let imageData = "";
+                    fileInput.onchange = () => {
+                        const file = fileInput.files?.[0];
+                        if (!file) {
+                            imageData = "";
+                            previewEl = document.createElement("div");
+                            previewEl.className = "ems-custom-preview is-empty";
+                            previewEl.innerText = "+";
+                            imageRow.replaceChildren(previewEl, fileInput);
+                            return;
+                        }
+                        const reader = new FileReader();
+                        reader.onload = () => {
+                            if (!isCurrent() || fileInput.files?.[0] !== file) return;
+                            imageData = String(reader.result || "");
+                            const img = document.createElement("img");
+                            img.className = "ems-custom-preview";
+                            img.src = imageData;
+                            previewEl = img;
+                            imageRow.replaceChildren(previewEl, fileInput);
+                        };
+                        reader.readAsDataURL(file);
+                    };
+
+                    imageRow.append(previewEl, fileInput);
+
+                    const imageField = document.createElement("div");
+                    imageField.className = "ems-field";
+                    const imageLabel = document.createElement("span");
+                    imageLabel.className = "ems-label";
+                    imageLabel.innerText = "Image";
+                    imageField.append(imageLabel, imageRow);
+
+                    const error = document.createElement("div");
+                    error.className = "ems-custom-error";
+
+                    form.append(
+                        createCustomEmotionField("Name", nameInput),
+                        createCustomEmotionField("Tags / Description", tagsInput),
+                        createCustomEmotionField("Natural Prompt", promptInput),
+                        imageField,
+                        error
+                    );
+
+                    const actions = document.createElement("div");
+                    actions.className = "ems-modal-actions";
+
+                    const btnCancel = document.createElement("button");
+                    btnCancel.className = "ems-modal-btn ems-modal-btn--cancel";
+                    btnCancel.innerText = "Cancel";
+                    btnCancel.onclick = () => backdrop.remove();
+
+                    const btnSave = document.createElement("button");
+                    btnSave.className = "ems-modal-btn ems-modal-btn--confirm";
+                    btnSave.innerText = "Save";
+                    btnSave.onclick = async () => {
+                        if (!isCurrent()) return;
+                        const name = nameInput.value.trim();
+                        if (!name) {
+                            error.innerText = "Name is required.";
+                            nameInput.focus();
+                            return;
+                        }
+
+                        error.innerText = "";
+                        btnSave.disabled = true;
+                        btnSave.innerText = "Saving...";
+                        try {
+                            const res = await api.fetchApi("/vnccs/add_custom_emotion", {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify({
+                                    name,
+                                    description: tagsInput.value.trim(),
+                                    natural_prompt: promptInput.value.trim(),
+                                    image_data: imageData,
+                                }),
+                            });
+                            const data = await res.json().catch(() => ({}));
+                            if (!isCurrent()) return;
+                            if (!res.ok) throw new Error(data.error || "Failed to save custom emotion.");
+
+                            const emotion = data.emotion;
+                            if (!emotion?.safe_name) throw new Error("Server did not return a valid emotion.");
+                            state.emotions = state.emotions.filter(e => e.safe_name !== emotion.safe_name);
+                            state.emotions.push(emotion);
+                            state.selectedEmotions.add(emotion.safe_name);
+                            renderEmotions();
+                            updateEmotionsData();
+                            backdrop.remove();
+                        } catch (e) {
+                            if (!isCurrent()) return;
+                            error.innerText = e.message || String(e);
+                            btnSave.disabled = false;
+                            btnSave.innerText = "Save";
+                        }
+                    };
+
+                    actions.append(btnCancel, btnSave);
+                    modal.append(text, form, actions);
+                    backdrop.appendChild(modal);
+                    container.appendChild(backdrop);
+                    nameInput.focus();
+                }
+
+                node._validateBeforeQueue = function() {
+                    if (restoreErrors.size) {
+                        showModalText("Settings restore failed", `Unable to restore saved state: ${Array.from(restoreErrors.keys()).join(", ")}. The saved data is preserved. Reload a valid workflow before editing or running.`);
+                        return false;
+                    }
+                    if (state.selectedCostumes.size === 0 && state.selectedEmotions.size === 0) {
+                        showModalText("Nothing selected", "Please select at least one costume and one emotion before running.");
+                        return false;
+                    }
+                    if (state.selectedCostumes.size === 0) {
+                        showModalText("No costumes selected", "Please enable at least one costume.");
+                        return false;
+                    }
+                    if (state.selectedEmotions.size === 0) {
+                        showModalText("No emotions selected", "Please select at least one emotion.");
+                        return false;
+                    }
+                    if (state.selectedPoseIndices !== null && selectedPoseIndexList().length === 0) {
+                        showModalText("No poses selected", "Select at least one pose in Generate poses.");
+                        return false;
+                    }
+                    return true;
+                };
+
+                const showConfirm = (title, message, onConfirm) => showModalText(title, message, onConfirm);
+
+                function restoreStateFromWidgets() {
+                    if (disposed) return;
+                    beginSelectionRequest();
+                    // 1. Character
+                    if (charWidget && charWidget.value) {
+                        state.character = charWidget.value;
+                        if (![...charSelect.options].some(opt => opt.value === charWidget.value)) {
+                            const opt = document.createElement("option");
+                            opt.value = charWidget.value;
+                            opt.innerText = charWidget.value;
+                            charSelect.appendChild(opt);
+                        }
+                        charSelect.value = charWidget.value;
+                        fetchCharacterData(state.character);
+                    }
+
+                    if (modelWidget && modelWidget.value) {
+                        state.gen.generation_mode = String(modelWidget.value).toLowerCase();
+                    }
+                    if (generationSettingsWidget) {
+                        state.gen = parseGenerationSettings();
+                        restorePoseSelectionFromGenerationSettings();
+                    }
+                    if (styleWidget) commitWidget(styleWidget, promptStyleForMode(state.gen.generation_mode), false);
+                    syncGenerationControls();
+                    renderPoseSelection();
+
+                    // 3. Costumes & Emotions (from hidden text strings)
+                    if (costumesDataWidget) {
+                        state.selectedCostumes = parseSelection(costumesDataWidget);
+                        renderCostumes();
+                    }
+                    if (emotionsDataWidget) {
+                        state.selectedEmotions = parseSelection(emotionsDataWidget);
+                    }
+                }
+
+                node._vnccsEmotionRestoreFromWidgets = () => {
+                    if (disposed) return;
+                    restoreStateFromWidgets();
+                    renderEmotions();
+                    renderCostumes();
+                    updateButtonState();
+                    return refreshCharacterList();
+                };
+                node._vnccsEmotionApplySerializedInfo = (info) => {
+                    const values = Array.isArray(info?.widgets_values) ? info.widgets_values : null;
+                    if (!values) return;
+                    receivedSerializedConfig = true;
+                    const widgetOrder = [
+                        ["generation_model", modelWidget],
+                        ["generation_settings", generationSettingsWidget],
+                        ["prompt_style", styleWidget],
+                        ["character", charWidget],
+                        ["costumes_data", costumesDataWidget],
+                        ["emotions_data", emotionsDataWidget],
+                    ];
+                    widgetOrder.forEach(([_, widget], index) => {
+                        if (widget && values[index] !== undefined) widget.value = values[index];
+                    });
+                };
+                node._vnccsEmotionPersistAllState = persistAllState;
+
+                // Apply size on explicit resize too
+                const originalResize = node.onResize;
+                node.onResize = function (size) {
+                    originalResize?.apply(this, arguments);
+                    syncDOMWidgetWidth(node, "emotion_ui_v2");
+                    requestAnimationFrame(() => syncDOMWidgetWidth(node, "emotion_ui_v2"));
+                    applySize();
+                }
+
+                // Helper
+                function getFilteredEmotions() {
+                    if (!state.searchTerm) return state.emotions;
+                    const term = state.searchTerm.toLowerCase();
+                    return state.emotions.filter(e => {
+                        const nameMatch = e.safe_name.toLowerCase().includes(term);
+                        const descMatch = (e.description || "").toLowerCase().includes(term);
+                        return nameMatch || descMatch;
+                    });
+                }
+
+                // Button Logic & Text Update
+                function updateButtonState() {
+                    const filtered = getFilteredEmotions();
+                    if (filtered.length === 0) {
+                        btnAll.innerText = "No Emotions Found";
+                        btnAll.disabled = true;
+                        btnAll.classList.remove("cancel");
+                        return;
+                    }
+                    btnAll.disabled = false;
+
+                    const allFilteredSelected = filtered.every(e => state.selectedEmotions.has(e.safe_name));
+
+                    if (allFilteredSelected) {
+                        btnAll.innerText = "Cancel Selection";
+                        btnAll.classList.add("cancel");
+                    } else {
+                        btnAll.innerText = "Select ALL";
+                        btnAll.classList.remove("cancel");
+                    }
+                }
+
+                btnAll.onclick = () => {
+                    const filtered = getFilteredEmotions();
+                    if (filtered.length === 0) return;
+
+                    const allFilteredSelected = filtered.every(e => state.selectedEmotions.has(e.safe_name));
+
+                    if (allFilteredSelected) {
+                        // Deselect visible
+                        filtered.forEach(e => state.selectedEmotions.delete(e.safe_name));
+                        renderEmotions();
+                        updateEmotionsData();
+                    } else {
+                        // Select All Visible
+                        const numEmotions = filtered.length;
+                        const numCostumes = state.selectedCostumes.size;
+                        const numPoses = selectedPoseCount();
+                        const total = numEmotions * numCostumes * numPoses;
+                        const isCurrent = beginSelectionRequest();
+                        const character = state.character;
+
+                        showConfirm("Select visible emotions", `Emotions: ${numEmotions}\nCostumes: ${numCostumes}\nPoses: ${numPoses}\nTotal: ${total} images.`, () => {
+                            if (!isCurrent() || state.character !== character) return;
+                            filtered.forEach(e => state.selectedEmotions.add(e.safe_name));
+                            renderEmotions();
+                            updateEmotionsData();
+                        });
+                    }
+                };
+
+                // Functions
+                function updateCostumesData() {
+                    const list = Array.from(state.selectedCostumes);
+                    commitWidget(costumesDataWidget, JSON.stringify(list));
+                }
+
+                function updateEmotionsData() {
+                    const list = Array.from(state.selectedEmotions);
+                    commitWidget(emotionsDataWidget, JSON.stringify(list));
+                    updateButtonState();
+                }
+
+                function resetSelectedEmotionsForCharacterChange() {
+                    beginSelectionRequest();
+                    state.selectedEmotions = new Set();
+                    state.selectedPoseIndices = null;
+                    state.poseCount = 0;
+                    delete state.gen.selected_pose_indices;
+                    updateEmotionsData();
+                    renderEmotions();
+                    saveGenerationSettings(false);
+                    renderPoseSelection();
+                }
+
+                function createEmotionCard(e, compact = false) {
+                    const div = document.createElement("div");
+                    const selected = state.selectedEmotions.has(e.safe_name);
+                    div.className = "ems-emotion-item" + (selected ? " selected" : "") + (compact ? " compact" : "");
+                    div.title = e.description || "";
+                    div.dataset.focusKey = `emotion-${compact ? "selected" : "library"}-${e.safe_name}`;
+                    div.setAttribute("role", "button");
+                    div.setAttribute("aria-label", e.safe_name);
+                    div.setAttribute("aria-pressed", String(selected));
+                    div.tabIndex = 0;
+                    div.onkeydown = event => {
+                        if (["Enter", " "].includes(event.key)) { event.preventDefault(); div.click(); }
+                    };
+
+                    const img = document.createElement("img");
+                    img.className = "ems-emotion-img";
+                    img.alt = "";
+                    img.loading = "lazy";
+                    img.decoding = "async";
+                    img.src = mediaURL(`/vnccs/get_emotion_image?name=${encodeURIComponent(e.safe_name)}&v=webp`);
+                    img.onerror = () => {
+                        const placeholder = document.createElement("div");
+                        placeholder.className = "ems-emotion-img ems-emotion-img-placeholder";
+                        placeholder.innerText = "No Image";
+                        img.replaceWith(placeholder);
+                    };
+
+                    const lbl = document.createElement("div");
+                    lbl.className = "ems-emotion-label";
+                    lbl.innerText = e.safe_name;
+
+                    div.appendChild(img);
+                    div.appendChild(lbl);
+
+                    div.onclick = () => {
+                        if (state.selectedEmotions.has(e.safe_name)) {
+                            state.selectedEmotions.delete(e.safe_name);
+                        } else {
+                            state.selectedEmotions.add(e.safe_name);
+                        }
+                        renderEmotions();
+                        updateEmotionsData();
+                    };
+
+                    return div;
+                }
+
+                function createAddCustomEmotionCard() {
+                    const div = document.createElement("div");
+                    div.className = "ems-emotion-item compact add-custom";
+                    div.title = "Add Custom Emotion";
+
+                    const box = document.createElement("div");
+                    box.className = "ems-emotion-add-box";
+                    box.innerText = "+";
+
+                    const lbl = document.createElement("div");
+                    lbl.className = "ems-emotion-label";
+                    lbl.innerText = "Add Custom Emotion";
+
+                    div.append(box, lbl);
+                    div.onclick = () => showCustomEmotionModal();
+                    return div;
+                }
+
+                function renderCostumes() {
+                    const view = ui.captureView();
+                    costumesList.innerHTML = "";
+                    new Set([...state.costumes, ...state.selectedCostumes]).forEach(c => {
+                        if (c === "Original" && !state.costumes.includes(c)) return;
+                        const lbl = document.createElement("label");
+                        lbl.className = "ems-checkbox-item";
+                        lbl.dataset.focusKey = `costume-toggle-${c}`;
+                        lbl.dataset.toggleState = String(state.selectedCostumes.has(c));
+
+                        const toggle = document.createElement("div");
+                        toggle.className = "em-toggle";
+
+                        const chk = document.createElement("input");
+                        chk.type = "checkbox";
+                        chk.dataset.focusKey = `costume-${c}`;
+                        chk.checked = state.selectedCostumes.has(c);
+                        chk.onchange = () => {
+                            if (chk.checked) state.selectedCostumes.add(c);
+                            else state.selectedCostumes.delete(c);
+                            lbl.dataset.toggleState = String(chk.checked);
+                            updateCostumesData();
+                        };
+
+                        const track = document.createElement("div");
+                        track.className = "em-toggle-track vnccs-common-ui-toggle-track";
+                        const thumb = document.createElement("div");
+                        thumb.className = "em-toggle-thumb vnccs-common-ui-toggle-thumb";
+
+                        toggle.appendChild(chk);
+                        toggle.appendChild(track);
+                        toggle.appendChild(thumb);
+
+                        const span = document.createElement("span");
+                        span.innerText = state.costumes.includes(c) ? c : `${c} (missing sprites)`;
+
+                        lbl.appendChild(toggle);
+                        lbl.appendChild(span);
+                        costumesList.appendChild(lbl);
+                    });
+                    ui.restoreView(view);
+                }
+
+                function renderEmotions() {
+                    const view = ui.captureView();
+                    selectedEmotionsList.innerHTML = "";
+                    const selectedNames = Array.from(state.selectedEmotions);
+                    selectedEmotionsHeader.innerText = `Selected emotions (${selectedNames.length})`;
+                    selectedEmotionsList.appendChild(createAddCustomEmotionCard());
+                    if (selectedNames.length === 0) {
+                        const empty = document.createElement("div");
+                        empty.className = "ems-selected-emotions-empty";
+                        empty.innerText = "No emotions selected";
+                        selectedEmotionsList.appendChild(empty);
+                    } else {
+                        const byName = new Map(state.emotions.map(e => [e.safe_name, e]));
+                        selectedNames.forEach(name => {
+                            const emotion = byName.get(name) || { safe_name: name, description: "" };
+                            selectedEmotionsList.appendChild(createEmotionCard(emotion, true));
+                        });
+                    }
+
+                    emotionsGrid.innerHTML = "";
+                    const filtered = getFilteredEmotions();
+                    filtered.forEach(e => {
+                        emotionsGrid.appendChild(createEmotionCard(e));
+                    });
+                    updateButtonState();
+                    ui.restoreView(view);
+                }
+
+                async function fetchCharacterData(charName) {
+                    if (disposed || !charName || charName === "Character Name") return;
+                    const token = ++characterFetchToken;
+
+                    const selectedPreview = state.selectedPreviewSprite || state.gen?.selected_preview_sprite;
+                    spritePreviewNavigator?.load(charName, {
+                        index: selectedPreview?.character === charName ? selectedPreview.index : undefined,
+                    });
+
+                    // Costumes
+                    try {
+                        const res = await api.fetchApi(`/vnccs/get_character_costumes?character=${encodeURIComponent(charName)}`);
+                        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                        const validCostumes = await res.json();
+                        if (disposed || token !== characterFetchToken || charName !== state.character) return;
+                        if (!Array.isArray(validCostumes)) throw new Error("Costume list must be an array.");
+                        state.costumes = validCostumes;
+
+                        if (costumesDataWidget && costumesDataWidget.value) {
+                            const saved = parseSelection(costumesDataWidget);
+                            if (restoreErrors.size) return;
+                            state.selectedCostumes = new Set(
+                                [...saved].filter(costume => state.costumes.includes(costume))
+                            );
+                        } else {
+                            state.selectedCostumes = new Set(state.costumes);
+                        }
+
+                        renderCostumes();
+                        updateCostumesData();
+                    } catch (e) {
+                        console.error("Error fetching costumes", e);
+                    }
+                }
+
+                // Initial Load
+                api.fetchApi("/vnccs/get_emotions").then(async (res) => {
+                    if (res.ok) {
+                        const data = await res.json();
+                        if (disposed) return;
+                        let flat = [];
+                        for (let cat in data) {
+                            data[cat].forEach(e => flat.push({ ...e, category: cat }));
+                        }
+                        const byName = new Map(flat.map(emotion => [emotion.safe_name, emotion]));
+                        state.emotions.forEach(emotion => byName.set(emotion.safe_name, emotion));
+                        state.emotions = Array.from(byName.values());
+                        renderEmotions();
+
+                        // NOW restore selection state (after list loaded)
+                        if (!receivedSerializedConfig) restoreStateFromWidgets();
+                        // Re-render to show restored selections
+                        renderEmotions();
+                        renderCostumes();
+                        updateButtonState();
+                    }
+                });
+
+                if (state.character) {
+                    setTimeout(() => {
+                        if (!receivedSerializedConfig) fetchCharacterData(state.character);
+                    }, 50);
+                }
+                setTimeout(() => refreshCharacterList({ fetchData: false }), 80);
+
+                // Hook callback
+                if (charWidget) {
+                    const originalCb = charWidget.callback;
+                    charWidget.callback = function (v) {
+                        const previousCharacter = state.character;
+                        state.character = v;
+                        if (charSelect.value !== v) charSelect.value = v;
+                        if (v !== previousCharacter) {
+                            resetSelectedEmotionsForCharacterChange();
+                        }
+                        fetchCharacterData(v);
+                        if (originalCb) originalCb(v);
+                    };
+                }
+
+                setTimeout(() => {
+                    if (!receivedSerializedConfig) restoreStateFromWidgets();
+                }, 50);
+            };
+
+            const onConfigure = nodeType.prototype.onConfigure;
+            nodeType.prototype.onConfigure = function (info) {
+                onConfigure?.apply(this, arguments);
+                this._vnccsEmotionApplySerializedInfo?.(info);
+                this._vnccsEmotionRestoreFromWidgets?.();
+                syncDOMWidgetWidth(this, "emotion_ui_v2");
+                setTimeout(() => syncDOMWidgetWidth(this, "emotion_ui_v2"), 100);
+            };
+        }
+    }
+});
