@@ -2236,6 +2236,7 @@ Example:
     async def preview_generate(request):
         try:
             data = await request.json()
+            log_event("preview_source", component="Creator", source="legacy_route", character=str(data.get("character", "?")))
             return await run_preview_job(_generate_preview_response, data)
         except Exception as exc:
             log_event('exception', component='Creator', level='error', exc_info=True, truncate=False, message='Operation failed', error=str(exc))

@@ -1,6 +1,7 @@
 import { createStylePicker } from "./character_styles.mjs?v=style-mix-5";
 import { createSakuraInteractions } from "./sakura_interactions.mjs";
 import { app } from "../../scripts/app.js";
+window.__vnccsCreatorBuild = "queue-job-2026-10-21a";
 import { vnccsApi as api, mediaURL, checkedJSON, storage, refreshPreviewImage, watchConnection } from "./vnccs_transport.js";
 import { presetGroups, presetSelection } from "./character_presets.mjs?v=legacy-tags-1";
 import { createTraitInput, createQwenVLModelLoader, SAKURA_THEME_CSS, SAKURA_INTERACTION_CSS, debounce, registerCleanup, injectStyles, showModal as showCommonModal, showMessage, generateRandomSeed, syncDOMWidgetWidth, syncDOMWidgetWidthSoon, enableMiddleMouseCanvasPan, attachHelpTooltips, setHelpText, createRequestGuard, createControlCenterClient, installResolvedSeedTransport, animateWizardRows, resolutionScaleMegapixels, resolutionScaleValue, resolutionScaleText, RESOLUTION_SCALE_MIN_MP, RESOLUTION_SCALE_MAX_MP, RESOLUTION_SCALE_STEP_MP } from "./vnccs_common.js";
@@ -5158,6 +5159,7 @@ app.registerExtension({
                         try { jobData = JSON.parse(inputs); } catch {}
                         if (jobData) {
                             jobData.preview_valid = false;
+                            console.info("[vnccs-preview] build=" + window.__vnccsCreatorBuild, "submitting /prompt queue job for", character);
                             const clientId = (api.getClientId && api.getClientId()) || api.clientId || undefined;
                             const safeChar = String(character || "character").replace(/[^A-Za-z0-9_\-]/g, "_");
                             const jobBody = { prompt: {
@@ -5212,6 +5214,7 @@ app.registerExtension({
                             }
                         }
 
+                        console.warn("[vnccs-preview] LEGACY fallback route used for", character);
                         const r = await api.fetchApi("/vnccs/preview_generate", { method: "POST", body: inputs });
 
                         if (!r.ok) {
