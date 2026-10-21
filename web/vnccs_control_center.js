@@ -2820,14 +2820,43 @@ class VNCCSControlCenterWidget {
             const response = await api.fetchApi(`/customnode/versions/${encodeURIComponent(managerId)}`, {
                 cache: "no-store", signal: AbortSignal.timeout(8000),
             });
-            if (!response.ok) return null;
-            const versions = await response.json();
-            if (!Array.isArray(versions)) return null;
-            return versions.map(item => item?.version).filter(version => /^\d+\.\d+\.\d+$/.test(version))
-                .reduce((latest, version) => !latest || this._semverGt(version, latest) ? version : latest, null);
-        } catch {
-            return null;
+            if (response.ok) {
+                const versions = await response.json();
+                if (Array.isArray(versions)) {
+                    const best = versions.map(item => item?.version).filter(version => /^\d+\.\d+\.\d+$/.test(version))
+                        .reduce((latest, version) => !latest || this._semverGt(version, latest) ? version : latest, null);
+                    if (best) return best;
+                }
+            }
+        } catch { /* ComfyUI-Manager absent or registry unreachable — fall through to GitHub */ }
+        // Fallback when ComfyUI-Manager is not installed: latest GitHub release
+        // tag, then repo tags, then version = "x.y.z" in pyproject.toml on main.
+        const REPOS = { vnccs: "AHEKOT/ComfyUI_VNCCS", "vnccs-utils": "AHEKOT/ComfyUI_VNCCS_Utils" };
+        const repo = REPOS[managerId];
+        if (!repo) return null;
+        for (const probe of ["releases/latest", "tags?per_page=5"]) {
+            try {
+                const r = await fetch(`https://api.github.com/repos/${repo}/${probe}`, {
+                    cache: "no-store", signal: AbortSignal.timeout(8000),
+                    headers: { "Accept": "application/vnd.github+json" },
+                });
+                if (!r.ok) continue;
+                const data = await r.json();
+                const names = (Array.isArray(data) ? data.map(t => t?.name) : [data?.tag_name])
+                    .map(n => String(n || "").replace(/^v/i, "")).filter(n => /^\d+\.\d+\.\d+$/.test(n));
+                if (names.length) return names.reduce((a, b) => this._semverGt(b, a) ? b : a);
+            } catch { /* try next probe */ }
         }
+        try {
+            const r = await fetch(`https://raw.githubusercontent.com/${repo}/main/pyproject.toml`, {
+                cache: "no-store", signal: AbortSignal.timeout(8000),
+            });
+            if (r.ok) {
+                const m = (await r.text()).match(/^version\s*=\s*["'](\d+\.\d+\.\d+)["']/m);
+                if (m) return m[1];
+            }
+        } catch { /* give up; pill stays "update check unavailable" */ }
+        return null;
     }
 
     async _fetchModuleStatus() {
