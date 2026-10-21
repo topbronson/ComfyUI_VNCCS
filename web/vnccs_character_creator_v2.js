@@ -5098,10 +5098,51 @@ app.registerExtension({
 
                     const character = state.character;
                     const currentPreview = beginPreviewRequest();
+                    // LOCAL HOT-PATCH (re-ported to 3.3.0 2026-10-20): resolve the
+                    // upstream VNCCS_ControlCenter node (same walkback pattern as
+                    // clothes_designer) so the preview endpoint can reuse the live
+                    // pipe — including Select*Device routing. Omitted when no CC
+                    // is wired up; harmless extra fields when the server ignores them.
+                    const resolveConnectedControlCenter = () => {
+                        const resolveUpstreamNode = (startNode, inputName, maxDepth = 20) => {
+                            let currentNode = startNode;
+                            let currentInputName = inputName;
+                            for (let depth = 0; depth < maxDepth; depth++) {
+                                const input = currentNode?.inputs?.find((item) => item.name === currentInputName)
+                                    ?? currentNode?.inputs?.[0];
+                                const linkId = input?.link;
+                                if (linkId == null) return null;
+                                const link = app.graph?.links?.[linkId];
+                                const originId = link?.origin_id ?? link?.originId;
+                                if (originId == null) return null;
+                                const upstream = app.graph?.getNodeById?.(originId) ?? app.graph?._nodes_by_id?.[originId] ?? null;
+                                if (!upstream) return null;
+                                const comfyClass = upstream.comfyClass || upstream.type || "";
+                                if (comfyClass === "VNCCS_ControlCenter") return upstream;
+                                currentNode = upstream;
+                                currentInputName = "pipe";
+                            }
+                            return null;
+                        };
+                        const cc = resolveUpstreamNode(node, "pipe");
+                        if (!cc) return null;
+                        const repoWidget = cc.widgets?.find((w) => w.name === "repo_id");
+                        const stateWidget = cc.widgets?.find((w) => w.name === "node_state");
+                        const repo_id = String(repoWidget?.value ?? "").trim();
+                        const node_state = typeof stateWidget?.value === "string"
+                            ? stateWidget.value
+                            : JSON.stringify(stateWidget?.value ?? {});
+                        if (!repo_id || !node_state) return null;
+                        let selected_type = "";
+                        try { selected_type = String(JSON.parse(node_state)?.selected_type || ""); } catch {}
+                        return { repo_id, node_state, selected_type, control_center_id: String(cc.id) };
+                    };
+
                     const previewInputs = () => JSON.stringify({
                         _vnccs_seed_resolved: true,
                         character: state.character,
                         character_info: state.character_info,
+                        ...(resolveConnectedControlCenter() || {}),
                         gen_settings: { ...state.gen_settings,
                             lora_stack: state.gen_settings.lora_stack.filter(x => x.name && x.name !== "None") }
                     });
@@ -5109,6 +5150,67 @@ app.registerExtension({
                     const ownsRequest = () => currentPreview() && state.character === character;
                     const inputsStillCurrent = () => previewInputs() === inputs;
                     try {
+
+                        // Queue the preview as a real prompt job so the queue panel
+                        // shows standard job info (progress, elapsed, estimated time).
+                        // Falls back to the legacy in-process route if /prompt rejects.
+                        let jobData = null;
+                        try { jobData = JSON.parse(inputs); } catch {}
+                        if (jobData) {
+                            jobData.preview_valid = false;
+                            const clientId = (api.getClientId && api.getClientId()) || api.clientId || undefined;
+                            const safeChar = String(character || "character").replace(/[^A-Za-z0-9_\-]/g, "_");
+                            const jobBody = { prompt: {
+                                preview_job: { class_type: "CharacterCreatorV2", inputs: { widget_data: JSON.stringify(jobData) } },
+                                preview_sink: { class_type: "VNCCS_AssetSink", inputs: { images: ["preview_job", 0], character: String(state.character || character || "") } }
+                            } };
+                            if (clientId) jobBody.client_id = clientId;
+                            const pr = await api.fetchApi("/prompt", {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify(jobBody)
+                            });
+                            if (pr.ok) {
+                                const { prompt_id } = await pr.json();
+                                const deadline = Date.now() + 600000;
+                                for (;;) {
+                                    await new Promise(res => setTimeout(res, 1000));
+                                    if (!ownsRequest()) return;
+                                    if (Date.now() > deadline) throw new Error("Preview job timed out");
+                                    const hr = await api.fetchApi("/history/" + encodeURIComponent(prompt_id));
+                                    if (!hr.ok) continue;
+                                    const hj = await hr.json();
+                                    const rec = hj[prompt_id];
+                                    if (!rec) continue;
+                                    const st = rec.status || {};
+                                    if (st.status_str === "error") throw new Error("Preview job failed (see queue panel)");
+                                    const outs = (rec.outputs || {})["preview_job"] || {};
+                                    const imgs = (outs.ui && outs.ui.images) || outs.images || [];
+                                    if (st.completed && imgs.length) {
+                                        clearPreviewHandlers();
+                                        setPreviewLoading(false);
+                                        const qp = new URLSearchParams({ filename: imgs[0].filename, subfolder: imgs[0].subfolder || "", type: imgs[0].type || "output" });
+                                        previewPresented = await revealGeneratedPreview(mediaURL("/view?" + qp.toString() + "&t=" + Date.now()), character, generationRevision);
+                                        if (!previewPresented || !ownsRequest()) return;
+                                        state.preview_source = "gen";
+                                        hideSpriteNav();
+                                        saveState(inputsStillCurrent());
+                                        return;
+                                    }
+                                    if (st.completed) {
+                                        clearPreviewHandlers();
+                                        setPreviewLoading(false);
+                                        previewPresented = await revealGeneratedPreview(mediaURL(`/vnccs/get_cached_preview?character=${encodeURIComponent(character)}&t=${Date.now()}`), character, generationRevision);
+                                        if (previewPresented && ownsRequest()) {
+                                            state.preview_source = "gen";
+                                            hideSpriteNav();
+                                            saveState(inputsStillCurrent());
+                                        }
+                                        return;
+                                    }
+                                }
+                            }
+                        }
 
                         const r = await api.fetchApi("/vnccs/preview_generate", { method: "POST", body: inputs });
 

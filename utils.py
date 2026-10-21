@@ -978,3 +978,44 @@ def list_pose_preview_files(character_name, costume=None):
     except Exception as e:
         log_event('warning', component='Creator', level='warning', message=f'Pose Preview List Failed: {e}', error=str(e))
         return []
+
+
+def output_relative_images(paths):
+    """Map absolute paths under ComfyUI's output dir to node_outputs ui image
+    entries. Returning them from a node's function under {"ui": {"images": ...}}
+    makes the job queue / history show these thumbnails and registers the
+    saved files with the image history (asset library)."""
+    import folder_paths
+    out_root = os.path.realpath(folder_paths.get_output_directory())
+    entries = []
+    for p in paths or []:
+        try:
+            rp = os.path.realpath(p)
+        except (TypeError, ValueError):
+            continue
+        if rp.startswith(out_root + os.sep) and os.path.isfile(rp):
+            rel = os.path.relpath(rp, out_root)
+            sub, fname = os.path.split(rel)
+            entries.append({"filename": fname, "subfolder": sub.replace(os.sep, "/"), "type": "output"})
+    return entries
+
+
+def save_images_via_comfyui(images_tensor, subfolder, filename_prefix, subtype=None):
+    """Save a batch tensor through ComfyUI's native SaveImage path so the
+    files register with job outputs (queue/history thumbnails) and the asset
+    database. Returns the list of {"subfolder","filename","type"} entries."""
+    if images_tensor is None:
+        return []
+    try:
+        import nodes
+
+        inst = nodes.SaveImage()
+        prefix = f"{subfolder}/{filename_prefix}" if subfolder else filename_prefix
+        out = inst.save_images(
+            images_tensor,
+            filename_prefix=prefix,
+            extra_pnginfo=({"workflow": subtype} if subtype else None),
+        )
+        return out.get("ui", {}).get("images", []) if isinstance(out, dict) else []
+    except Exception:
+        return []

@@ -69,6 +69,8 @@ from .qi2_viggle import viggle_turbo_sigmas
 from .vnccs_utils import VNCCSChromaKey, VNCCS_MaskExtractor, _flatten_image_tensors, _as_bool
 from ..utils import (
     atomic_output_path,
+    output_relative_images,
+    save_images_via_comfyui,
     basename_agnostic,
     base_output_dir,
     character_dir,
@@ -2890,6 +2892,12 @@ class VNCCS_CharacterGenerator:
             saved_suffix = f"; saved {len(saved_paths)} sprites" if saved_paths else ""
             bg_done = "Chroma key skipped for" if bg_disabled else "Background removed from"
             self._emit(unique_id, "bg_remove", "done", final_images, f"{bg_done} {bg_total} images{saved_suffix}", bg_total, bg_total, cache_dir=cache_dir, preview_paths=saved_paths if bg_disabled else None)
+            # Register saved sprites with the job queue / history / assets via
+            # the staged files themselves (no duplicate copies).
+            _ui_images = output_relative_images(saved_paths)
+            if _ui_images:
+                return {"result": (final_images, final_images, pose_images, upscaled),
+                        "ui": {"images": _ui_images}}
             return final_images, final_images, pose_images, upscaled
         except Exception as exc:
             _forget_generator_context(unique_id, getattr(self, "_progress_scope", None))

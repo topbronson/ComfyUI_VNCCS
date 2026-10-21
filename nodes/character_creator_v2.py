@@ -22,6 +22,7 @@ import inspect
 import random
 import re
 import math
+import time
 from types import SimpleNamespace
 
 from ..utils import (
@@ -31,6 +32,7 @@ from ..utils import (
     list_characters, character_dir, base_output_dir,
     sheets_dir, faces_dir, normalize_hair_tags, ensure_safe_name,
     get_full_path_agnostic, atomic_output_path, safe_join_under,
+    output_relative_images, save_images_via_comfyui,
     privileged_route, file_fingerprint, config_path,
     character_storage_lock, list_pose_preview_files,
     StorageConflictError,
@@ -172,6 +174,143 @@ QI2_TEXT_GENERATION_DEFAULTS = {
     "use_default_template": True,
     "mtp": "auto",
 }
+
+# QI2 text-rewrite offload (Ollama)  — LOCAL HOT-PATCH (re-ported to 3.3.0 2026-10-20)
+# Native int8-convrot rewrite on XPU measured ~0.6-1.9 tok/s vs ~40 tok/s
+# on the Ollama box (2026-10-07 bench); the offload is driven by
+# user/default/vnccs_qi2_rewrite.json:
+#   {"chat_url": ".../v1/chat/completions", "model": "qwen3vl-unc",
+#    "enabled": true, "native_fallback": false, "timeout": 300}
+# When enabled and reachable, the QI2 rewrite LLM call only is served by
+# Ollama; the downstream PE expansion / weight stripping and the native
+# TextEncodeQwenImage21 conditioning are unchanged.
+# --------------------------------------------------------------------
+_QI2_REWRITE_CONFIG_FILE = "vnccs_qi2_rewrite.json"
+
+def _qi2_rewrite_config():
+    """Load user/default/vnccs_qi2_rewrite.json; {} when absent/invalid."""
+    try:
+        path = os.path.join(folder_paths.get_user_directory(), "default", _QI2_REWRITE_CONFIG_FILE)
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def _qi2_rewrite_via_ollama(system_prompt, request, *, model, chat_url,
+                            sampling=None, max_tokens=2048, timeout_s=300):
+    """Call the Ollama OpenAI-compatible chat endpoint; return text or raise.
+
+    ``sampling`` mirrors QI2_TEXT_GENERATION_DEFAULTS['sampling_mode'] so the
+    Ollama rewrite matches the native sampler (temperature/top_k/top_p/min_p/
+    repetition_penalty/seed) instead of Ollama defaults.
+    """
+    import urllib.request
+    import urllib.error
+    sampling = sampling or {}
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": request},
+        ],
+        "max_tokens": max_tokens,
+        "stream": False,
+        # LOCAL HOT-PATCH: pin the rewrite model in Ollama RAM for 30 min so
+        # first-run-after-idle doesn't pay ~70-100s of model reload
+        # (verified 2026-10-20: warm 31s vs cold 132s wall on qwen3vl-unc).
+        "keep_alive": "30m",
+        # Ollama OpenAI-compat: chat_template_kwargs passes through to the
+        # template; qwen3vl templates honour enable_thinking.
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    # Sampler parity with native TextGenerate (all verified accepted by /v1).
+    if sampling.get("sampling_mode") == "on":
+        body["temperature"] = sampling.get("temperature", 0.3)
+        body["top_k"] = sampling.get("top_k", 64)
+        body["top_p"] = sampling.get("top_p", 0.95)
+        body["min_p"] = sampling.get("min_p", 0.05)
+        body["repeat_penalty"] = sampling.get("repetition_penalty", 1.05)
+        body["seed"] = int(sampling.get("seed", 0))
+    def _post(b):
+        rq = urllib.request.Request(
+            chat_url,
+            data=json.dumps(b).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(rq, timeout=timeout_s) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    try:
+        payload = _post(body)
+    except urllib.error.HTTPError as exc:
+        # LOCAL HOT-PATCH: vLLM + MTP speculative decoding rejects min_p
+        # ("min_p and logit_bias ... not yet supported with speculative
+        # decoding", verified 2026-10-20). Ollama accepts it, so keep it in
+        # the first attempt and self-heal on 400 instead of losing fafo.
+        if exc.code == 400 and "min_p" in body:
+            body.pop("min_p", None)
+            payload = _post(body)
+        else:
+            raise
+    choices = payload.get("choices") or []
+    if not choices:
+        raise RuntimeError(f"Ollama returned no choices: {str(payload)[:300]}")
+    message = choices[0].get("message") or {}
+    content = message.get("content")
+    if content is None:
+        raise RuntimeError(f"Ollama returned empty content: {str(payload)[:300]}")
+    text = str(content).strip()
+    if not text:
+        raise RuntimeError("Ollama returned empty rewrite text")
+    return text
+
+def _qi2_rewrite_backend():
+    """Decide the rewrite backend(s) from config; returns dict or None for native.
+
+    LOCAL HOT-PATCH (2026-10-20): config may carry an ordered ``backends``
+    chain (e.g. fafo -> Ollama). Each entry: {chat_url, model, timeout?}.
+    Legacy single chat_url/model keys still work. Backends are tried in
+    order at the call site; connection-refused is immediate so a dead
+    fafo container falls through to Ollama in milliseconds. If every
+    backend fails, native_fallback decides between the (pathologically
+    slow, ~0.6-1.9 tok/s on XPU) native TextGenerate and raising.
+    """
+    cfg = _qi2_rewrite_config()
+    if not cfg.get("enabled", False):
+        return None
+    entries = []
+    raw = cfg.get("backends")
+    if isinstance(raw, list):
+        for b in raw:
+            if not isinstance(b, dict):
+                continue
+            cu = str(b.get("chat_url") or "").strip()
+            mo = str(b.get("model") or "").strip()
+            if cu and mo:
+                entries.append({
+                    "chat_url": cu,
+                    "model": mo,
+                    "timeout": int(b.get("timeout", cfg.get("timeout", 300))),
+                })
+    if not entries:
+        chat_url = str(cfg.get("chat_url") or "").strip()
+        model = str(cfg.get("model") or "").strip()
+        if chat_url and model:
+            entries.append({
+                "chat_url": chat_url,
+                "model": model,
+                "timeout": int(cfg.get("timeout", 300)),
+            })
+    if not entries:
+        print(f"[VNCCS Character Creator V2] QI2 rewrite offload enabled but no usable backends in {_QI2_REWRITE_CONFIG_FILE}; using native TextGenerate")
+        return None
+    return {
+        "backends": entries,
+        "native_fallback": bool(cfg.get("native_fallback", True)),
+        "max_tokens": int(QI2_TEXT_GENERATION_DEFAULTS["max_length"]),
+    }
+
 QI2_ALPHA_BACKGROUND_PROMPT = "transparent background with alpha channel"
 QI2_STYLE_REFERENCE_HEADING = "Visual style reference (rendering only):"
 QI2_STYLE_REWRITE_RULES = """## Character-only rewrite: external visual style
@@ -1247,12 +1386,37 @@ def generate_qi2_prompt(clip, character_prompt, style_reference="", character_in
     else:
         request = f"User image request:\n{str(character_prompt or '').strip()}"
     combined_prompt = f"{system_prompt}\n\n{request}"
-    generated_text = _call_comfy_node(
-        "TextGenerate",
-        clip=clip,
-        prompt=combined_prompt,
-        **QI2_TEXT_GENERATION_DEFAULTS,
-    )[0]
+    # LOCAL HOT-PATCH: route the rewrite LLM call to Ollama when configured.
+    backend = _qi2_rewrite_backend()
+    generated_text = None
+    if backend is not None:
+        for be in backend["backends"]:
+            try:
+                started = time.time()
+                generated_text = _qi2_rewrite_via_ollama(
+                    system_prompt, request,
+                    model=be["model"],
+                    chat_url=be["chat_url"],
+                    sampling=QI2_TEXT_GENERATION_DEFAULTS["sampling_mode"],
+                    timeout_s=be["timeout"],
+                    max_tokens=backend["max_tokens"],
+                )
+                print(f"[VNCCS Character Creator V2] QI2 rewrite via {be['model']} @ {be['chat_url']} in {time.time()-started:.1f}s")
+                break
+            except Exception as exc:
+                generated_text = None
+                print(f"[VNCCS Character Creator V2] QI2 rewrite backend {be['chat_url']} failed ({type(exc).__name__}: {exc}); trying next")
+        if generated_text is None and not backend["native_fallback"]:
+            raise RuntimeError(
+                "All configured QI2 rewrite backends failed and native_fallback is disabled"
+            )
+    if generated_text is None:
+        generated_text = _call_comfy_node(
+            "TextGenerate",
+            clip=clip,
+            prompt=combined_prompt,
+            **QI2_TEXT_GENERATION_DEFAULTS,
+        )[0]
     rewritten_prompt = _strip_unit_prompt_weights(
         _qi2_expanded_field_prompt(generated_text, fields) if fields is not None
         else _qi2_rewritten_prompt(generated_text, character_prompt)
@@ -1290,13 +1454,38 @@ def generate_creator_qi2_prompt(clip, character_prompt, style_reference="", char
                                "character_template", "qwen_image_21_t2i_system_prompt.txt")
     with open(prompt_path, "r", encoding="utf-8") as prompt_file:
         system_prompt = prompt_file.read().strip()
-    generated_text = _call_comfy_node(
-        "TextGenerate",
-        clip=clip,
-        prompt=request,
-        system_prompt=system_prompt,
-        **QI2_TEXT_GENERATION_DEFAULTS,
-    )[0]
+    # LOCAL HOT-PATCH: route the creator enhance rewrite to Ollama when configured.
+    backend = _qi2_rewrite_backend()
+    generated_text = None
+    if backend is not None:
+        for be in backend["backends"]:
+            try:
+                started = time.time()
+                generated_text = _qi2_rewrite_via_ollama(
+                    system_prompt, request,
+                    model=be["model"],
+                    chat_url=be["chat_url"],
+                    sampling=QI2_TEXT_GENERATION_DEFAULTS["sampling_mode"],
+                    timeout_s=be["timeout"],
+                    max_tokens=backend["max_tokens"],
+                )
+                print(f"[VNCCS Character Creator V2] QI2 creator rewrite via {be['model']} @ {be['chat_url']} in {time.time()-started:.1f}s")
+                break
+            except Exception as exc:
+                generated_text = None
+                print(f"[VNCCS Character Creator V2] QI2 creator rewrite backend {be['chat_url']} failed ({type(exc).__name__}: {exc}); trying next")
+        if generated_text is None and not backend["native_fallback"]:
+            raise RuntimeError(
+                "All configured QI2 rewrite backends failed and native_fallback is disabled"
+            )
+    if generated_text is None:
+        generated_text = _call_comfy_node(
+            "TextGenerate",
+            clip=clip,
+            prompt=request,
+            system_prompt=system_prompt,
+            **QI2_TEXT_GENERATION_DEFAULTS,
+        )[0]
     log_event("prompt_enhancement_output", component="Creator", level="debug", output=generated_text, truncate=False)
     rewritten_prompt = _strip_unit_prompt_weights(_qi2_rewritten_prompt(generated_text, request))
     applied = rewritten_prompt != request
@@ -2625,6 +2814,13 @@ class CharacterCreatorV2:
             pil_img = pil_img.resize((512, 1536), Image.LANCZOS)
             image = pil2tensor(pil_img)
 
+        # Register the character preview with the job queue / history / asset
+        # database via the existing cache file (no duplicate copies).
+        _ui_images = output_relative_images([cache_path])
+        if _ui_images:
+            return {"result": (image, sheets_path, background_color),
+                    "ui": {"images": _ui_images}}
+
         return (
             image,
             sheets_path,
@@ -2632,10 +2828,58 @@ class CharacterCreatorV2:
         )
 
 
+class VNCCS_AssetSink:
+    """Output-node sink: writes nothing itself. Accepts an optional image
+    stream (so it can sit at the end of a job graph) and registers the
+    character's existing preview/sprite files as this job's outputs, which
+    drives queue/history thumbnails and asset registration without duplicate
+    file copies."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {},
+            "optional": {
+                "images": ("IMAGE",),
+                "character": ("STRING", {"default": ""}),
+            },
+        }
+
+    RETURN_TYPES = ()
+    OUTPUT_NODE = True
+    FUNCTION = "sink"
+    CATEGORY = "VNCCS"
+    DESCRIPTION = "Marks a job complete and registers existing VNCCS output files (preview/sprites) with the job, queue and asset library without saving new files."
+
+    def sink(self, images=None, character=""):
+        entries = []
+        character = str(character or "").strip()
+        if character:
+            try:
+                paths = []
+                cache_preview = safe_join_under(character_dir(character), "cache", "preview.png")
+                if os.path.isfile(cache_preview):
+                    paths.append(cache_preview)
+                sprites_root = safe_join_under(character_dir(character), "Sprites")
+                if os.path.isdir(sprites_root):
+                    for _dirpath, _dirnames, filenames in os.walk(sprites_root):
+                        for fname in sorted(filenames):
+                            if fname.startswith("sprite_pose_") and fname.endswith(".png"):
+                                paths.append(os.path.join(_dirpath, fname))
+                entries = output_relative_images(paths)
+            except Exception:
+                entries = []
+        if entries:
+            return {"ui": {"images": entries}}
+        return None
+
+
 NODE_CLASS_MAPPINGS = {
     "CharacterCreatorV2": CharacterCreatorV2,
+    "VNCCS_AssetSink": VNCCS_AssetSink,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "CharacterCreatorV2": "VNCCS Character Creator V2",
+    "VNCCS_AssetSink": "VNCCS Asset Sink",
 }
