@@ -62,6 +62,7 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
     let confirmation = null;
     let editingSecondary = false;
     let prefs = { favorites: [], sets: {} };
+    let prefsRevision = 0;
     let setFilter = "";
     let popover = null;
     let popoverOutside = null;
@@ -174,6 +175,7 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
         if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
         if (!result || !Array.isArray(result.favorites) || !result.sets) throw new Error("Invalid style preferences response");
         prefs = { favorites: result.favorites, sets: result.sets };
+        prefsRevision++;
     };
     const closePopover = () => {
         popover?.remove();
@@ -233,9 +235,11 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
     };
     const refreshPrefs = async () => {
         const currentOverlay = overlay;
+        const revision = prefsRevision;
         const response = await fetchApi("/vnccs/style_prefs");
         const result = await response.json().catch(() => null);
         if (disposed || !overlay || overlay !== currentOverlay || !response.ok) return;
+        if (revision !== prefsRevision) return;  // a mutation landed mid-flight; its state is fresher
         if (result && Array.isArray(result.favorites) && result.sets) prefs = { favorites: result.favorites, sets: result.sets };
     };
     const toggleFavorite = async styleId => {
@@ -336,6 +340,7 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
         const setsBtn = make("button", "vnccs-creator-btn", "Sets ▾");
         setsBtn.title = "Style sets: create sets, add styles from each card's Sets button, then filter, rename, delete, or queue a preview run for a set.";
         setsBtn.onclick = () => { if (batch || deleting || !editor.hidden) return; openSetsMenu(setsBtn); };
+        setsBtn.hidden = editingSecondary;
         const add = make("button", "vnccs-creator-btn", "New style");
         const generateAll = make("button", "vnccs-creator-btn", "Generate all previews");
         generateAll.title = "Render every library style sequentially using current Creator settings and resolution scale. Stop finishes the current image.";
@@ -397,12 +402,15 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
             add.disabled = !editor.hidden || !!batch || deleting;
             generateAll.textContent = batch ? (batch.cancelled ? "Stopping..." : "Stop after current") : "Generate all previews";
             generateAll.disabled = loadingCatalog || deleting || !editor.hidden || !!batch?.cancelled;
-            for (const edit of grid.querySelectorAll(".vnccs-style-edit")) edit.disabled = !!batch || deleting;
-            for (const button of grid.querySelectorAll(".vnccs-style-delete")) button.disabled = loadingCatalog || !!batch || deleting;
+            if (batch) closePopover();
+            for (const tileHost of [grid, favGrid]) {
+                for (const edit of tileHost.querySelectorAll(".vnccs-style-edit")) edit.disabled = !!batch || deleting;
+                for (const button of tileHost.querySelectorAll(".vnccs-style-delete")) button.disabled = loadingCatalog || !!batch || deleting;
+                for (const button of tileHost.querySelectorAll(".vnccs-style-fav, .vnccs-style-sets-open")) button.disabled = !!batch || deleting;
+            }
             if (styleId) {
                 const style = allStyles().find(item => item.id === styleId) || (styleId === "custom" ? custom : null);
-                const slot = previewSlots.get(styleId);
-                if (slot) paintPreview(slot, style);
+                for (const slot of previewSlots.get(styleId) || []) paintPreview(slot, style);
                 if (getInfo().style === styleId) paintPreview(thumbnail, style);
                 if (getSecondaryInfo?.().style === styleId) paintPreview(secondaryThumbnail, style);
             }
@@ -434,7 +442,9 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
                 const placeholder = make("span", "vnccs-style-placeholder", "Preview");
                 placeholder.setAttribute("aria-hidden", "true");
                 paintPreview(placeholder, style);
-                if (!inFavorites) previewSlots.set(style.id, placeholder);
+                const slots = previewSlots.get(style.id) || [];
+                slots.push(placeholder);
+                previewSlots.set(style.id, slots);
                 card.append(placeholder, make("span", "vnccs-style-card-label", style.label));
                 card.onclick = () => {
                     if (style.id === "custom") {
@@ -448,14 +458,20 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
                     fav.title = starred ? "Remove from favorites" : "Add to favorites";
                     fav.setAttribute("aria-label", `${starred ? "Unfavorite" : "Favorite"} ${style.label}`);
                     fav.disabled = !!batch || deleting;
-                    fav.onclick = event => { event.stopPropagation(); toggleFavorite(style.id); };
+                    fav.onclick = async event => {
+                        event.stopPropagation();
+                        if (fav.disabled) return;
+                        fav.disabled = true;
+                        try { await toggleFavorite(style.id); }
+                        catch (error) { setStatus(`Favorites: ${error.message}`); fav.disabled = !!batch || deleting; }
+                    };
                     tile.append(fav);
                     if (style.id !== "custom" && !editingSecondary) {
                         const setsOpen = make("button", "vnccs-style-sets-open", "⛁");
                         setsOpen.title = "Add this style to a set";
                         setsOpen.setAttribute("aria-label", `Sets for ${style.label}`);
                         setsOpen.disabled = !!batch || deleting;
-                        setsOpen.onclick = event => { event.stopPropagation(); openTileSetsMenu(setsOpen, style); };
+                        setsOpen.onclick = event => { event.stopPropagation(); if (batch || deleting) return; openTileSetsMenu(setsOpen, style); };
                         tile.append(setsOpen);
                     }
                 }
@@ -544,6 +560,7 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
             editor.replaceChildren();
             editor.hidden = false;
             grid.hidden = true;
+            favHead.hidden = favGrid.hidden = true;  // live favorite cards would silently discard the draft
             search.disabled = filter.disabled = add.disabled = true;
             status.textContent = style.id ? "Edit your style" : "Create your style";
             updateGallery();

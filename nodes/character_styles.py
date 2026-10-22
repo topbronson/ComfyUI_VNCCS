@@ -187,8 +187,8 @@ def delete_user_style(style_id, path=None):
                 prefs["favorites"] = [item for item in prefs["favorites"] if item != style_id]
                 prefs["sets"] = {key: [item for item in value if item != style_id] for key, value in prefs["sets"].items()}
                 _save_style_prefs(prefs, USER_STYLE_PREFS_PATH)
-        except ValueError:
-            pass
+        except (OSError, ValueError):
+            pass  # best-effort: dangling ids never render and are pruned by _validate_prefs
         return True
 
 
@@ -207,7 +207,7 @@ def save_user_style_preview(style_id, image, revision):
 # Style preferences: favorites and named sets (global, character-independent)
 # ------------------------------------------------------------------
 USER_STYLE_PREFS_PATH = os.path.join(os.path.dirname(USER_CHARACTER_STYLES_PATH), "character_styles.prefs.json")
-_MAX_PREFS_BYTES = 262144
+_MAX_PREFS_BYTES = 2621440  # must exceed worst case: _MAX_SETS x _MAX_SET_MEMBERS x max id len
 _SET_NAME_LIMIT = 60
 _MAX_SETS = 50
 _MAX_SET_MEMBERS = 200

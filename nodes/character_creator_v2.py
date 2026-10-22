@@ -2505,13 +2505,27 @@ if server:
     @privileged_route
     async def post_style_prefs(request):
         try:
-            body = await request.json()
+            if request.content_length is not None and request.content_length > 8192:
+                return web.json_response({"error": "Preferences payload is too large"}, status=413)
+            body = bytearray()
+            async for chunk in request.content.iter_chunked(4096):
+                body.extend(chunk)
+                if len(body) > 8192:
+                    return web.json_response({"error": "Preferences payload is too large"}, status=413)
+            body = json.loads(body)
         except (ValueError, UnicodeError):
             return web.json_response({"error": "Invalid JSON"}, status=400)
         if not isinstance(body, dict):
             return web.json_response({"error": "Preferences payload must be a JSON object"}, status=400)
         action = body.get("action")
         try:
+            if action in ("toggle_favorite", "toggle_member"):
+                # Reject phantom ids so quota slots cannot be polluted by
+                # styles that never existed in any catalog.
+                known = set(ALL_CHARACTER_STYLE_PROMPTS) | set(ALL_CHARACTER_STYLE_ALIASES) | {"custom"}
+                known |= {style["id"] for style in await asyncio.to_thread(load_user_styles)}
+                if body.get("style_id") not in known:
+                    return web.json_response({"error": "Unknown style ID"}, status=400)
             if action == "toggle_favorite":
                 prefs = await asyncio.to_thread(toggle_style_favorite, body.get("style_id"))
             elif action == "create_set":
