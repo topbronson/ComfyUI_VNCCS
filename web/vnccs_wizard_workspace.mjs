@@ -272,7 +272,7 @@ export async function openWizardWorkspace(ctx) {
         if (r?.row) r.row.style.display = draft.sex === "female" ? "" : "none";
     }
 
-    function markDirty() { dirty = true; refreshModifiedMarks(); }
+    function markDirty() { dirty = true; refreshModifiedMarks(); persistSoon(); }
 
     function refreshModifiedMarks() {
         const seed = seedDraft(state.character_info || {});
@@ -379,10 +379,63 @@ export async function openWizardWorkspace(ctx) {
     newChatBtn.title = "Clear the assistant chat (the draft sheet stays)";
     newChatBtn.addEventListener("click", () => {
         draftConvo.length = 0;
+        persistSession();
         msgs.innerHTML = ""; // Safe: constant-string child clear (no external content).
         infoTurn("New chat — the designer starts fresh; your draft sheet is unchanged.");
     });
     toolbar.appendChild(newChatBtn);
+
+    // ---- session persistence -------------------------------------------------
+    // The workspace survives close/reopen (and page reloads): chat, draft
+    // sheet and experiment tags are stored per character through the node's
+    // scoped storage. “New chat” intentionally starts a fresh conversation;
+    // “Reset from node” reloads the sheet from the node.
+    const PERSIST_TURNS_MAX = 60;
+    function persistSession() {
+        try {
+            ctx.saveWizardSession?.({
+                v: 1,
+                turns: draftConvo.slice(-PERSIST_TURNS_MAX),
+                draft: stripName(draft),
+                experimentTags: experimentTags.slice(0, 8),
+            });
+        } catch (e) { /* storage is best-effort */ }
+    }
+    let persistTimer = null;
+    function persistSoon() {
+        if (persistTimer) return;
+        persistTimer = setTimeout(() => { persistTimer = null; persistSession(); }, 400);
+    }
+    const sessionRestored = (function restoreSession() {
+        let saved = null;
+        try { saved = ctx.loadWizardSession?.() || null; } catch (e) { saved = null; }
+        if (!saved || typeof saved !== "object") return;
+        let restored = 0;
+        if (Array.isArray(saved.turns)) {
+            for (const msg of saved.turns) {
+                if (!msg || typeof msg.text !== "string" || !msg.text.trim()) continue;
+                const role = msg.role === "assistant" ? "assistant" : "user";
+                draftConvo.push({ role, text: msg.text });
+                const t = turn(role === "user" ? "user" : "model");
+                t.textContent = msg.text;
+                restored += 1;
+            }
+        }
+        if (saved.draft && typeof saved.draft === "object") {
+            for (const f of TEXT_FIELDS) {
+                if (typeof saved.draft[f.key] === "string") draft[f.key] = saved.draft[f.key];
+            }
+            if (saved.draft.sex === "male" || saved.draft.sex === "female") draft.sex = saved.draft.sex;
+            const a = parseInt(saved.draft.age, 10);
+            if (Number.isFinite(a)) draft.age = Math.max(1, Math.min(100, a));
+        }
+        if (saved.experimentTags && Array.isArray(saved.experimentTags)) {
+            experimentTags = saved.experimentTags.filter(t => typeof t === "string").slice(0, 8);
+        }
+        const sessionRestored = restored > 0 || Boolean(saved.draft) || Array.isArray(saved.experimentTags);
+        if (restored) infoTurn(`Session restored — ${restored} chat turn${restored === 1 ? "" : "s"} and your draft from last time. “New chat” starts a fresh conversation; “Reset from node” reloads the sheet.`);
+        return sessionRestored;
+    })();
     toolbar.appendChild(fieldSel);
     consolePane.appendChild(toolbar);
 
@@ -458,6 +511,7 @@ export async function openWizardWorkspace(ctx) {
             payload.history = draftConvo.slice(-12);
             payload.draft = stripName(draft);
             draftConvo.push({ role: "user", text });
+            persistSession();
         }
         else if (action === "reroll_field" || action === "polish_field") {
             payload.field = fieldSel.value; payload.instruction = text; payload.draft = stripName(draft);
@@ -534,6 +588,7 @@ export async function openWizardWorkspace(ctx) {
                     + "[current draft] " + ["sex", "age", "race", "skin_color", "body", "face", "hair", "eyes", "additional_details"]
                         .map(k => `${k}=${data[k] ?? ""}`).join("; "),
             });
+            persistSession();
             const kv = document.createElement("div");
             kv.className = "vnccs-ws-kv";
             kv.textContent = ["sex", "age", "race", "skin_color", "body", "face", "hair", "eyes", "additional_details"]
@@ -801,6 +856,7 @@ export async function openWizardWorkspace(ctx) {
     foot.append(resetBtn, cancelBtn, applyBtn);
     panel.append(expRow, foot);
     renderExpRow();
+    if (sessionRestored) { renderDraftSheet(); renderExpRow(); } // re-render with restored sheet/tags
 
     resetBtn.addEventListener("click", () => {
         draft = seedDraft(state.character_info || {});
@@ -808,6 +864,7 @@ export async function openWizardWorkspace(ctx) {
         dirty = false;
         renderDraftSheet();
         renderExpRow();
+        persistSession();
         infoTurn("Draft reset from node values.");
     });
     cancelBtn.addEventListener("click", () => confirmClose());
@@ -872,6 +929,8 @@ export async function openWizardWorkspace(ctx) {
     function close() {
         if (closed) return;
         closed = true;
+        persistSession();
+        if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
         overlay.remove();
         document.removeEventListener("keydown", onKeydown, true);
         els.charSelect?.removeEventListener?.("change", onCharSwitch);

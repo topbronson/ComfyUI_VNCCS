@@ -160,6 +160,8 @@ async function mount(seed = {}, opts = {}) {
         ensureQwenVLReady: async () => true,
         createCharacterByName: opts.create,
         selectCharacterByName: opts.select,
+        loadWizardSession: opts.session ? () => { try { return JSON.parse(opts.session.blob || "null"); } catch { return null; } } : undefined,
+        saveWizardSession: opts.session ? (s) => { opts.session.blob = JSON.stringify(s); } : undefined,
     };
     const { openWizardWorkspace } = await import("../web/vnccs_wizard_workspace.mjs");
     const handle = await openWizardWorkspace(ctx);
@@ -476,3 +478,55 @@ test("names payload never carries the draft name to the assist API", async () =>
     w.close();
 });
 
+
+// ── session persistence: chat + draft survive close/reopen ──────────────────
+
+test("session persists across close/reopen; New chat clears only the conversation", async () => {
+    const session = { blob: null };
+    const w = await mount({}, { session });
+    w.input().value = "make her a fox shrine priestess";
+    fire(w.send(), "click");
+    await settle();
+    const hair = w.draftRow("Hair").children[1];
+    hair.value = "silver_hair, long_hair";
+    fire(hair, "input");
+    w.close();
+
+    const saved = JSON.parse(session.blob);
+    assert.equal(saved.turns.length, 2, "user + assistant turn stored");
+    assert.equal(saved.turns[0].role, "user");
+    assert.equal(saved.turns[1].role, "assistant");
+    assert.equal(saved.draft.hair, "silver_hair, long_hair");
+    assert.ok(!("name" in saved.draft), "routing name never persisted");
+
+    const w2 = await mount({}, { session });
+    const turns = byClass(w2.panel, "vnccs-ws-turn");
+    assert.ok(turns.some(t => t._classes.has("user") && (t.textContent || "").includes("fox shrine priestess")),
+        "user bubble redrawn after reopen");
+    assert.ok(turns.some(t => t._classes.has("model") && (t.textContent || "").includes("current draft")),
+        "assistant bubble redrawn after reopen");
+    assert.equal(w2.draftRow("Hair").children[1].value, "silver_hair, long_hair", "draft sheet restored");
+    assert.ok(byClass(w2.panel, "vnccs-ws-turn").some(t => (t.textContent || "").includes("Session restored")));
+    // chat continuity: next send carries the restored history
+    w2.input().value = "make her younger";
+    fire(w2.send(), "click");
+    await settle();
+    const call = w2.t.requests.filter(r => r.route === "/vnccs/wizard/assist").at(-1);
+    const body = JSON.parse(call.options.body);
+    assert.equal(body.history.length, 2, "restored history reaches the server");
+    w2.close();
+
+    // New chat clears the conversation but keeps the draft
+    const w3 = await mount({}, { session });
+    fire(findText(w3.panel, "New chat"), "click");
+    w3.close();
+    const after = JSON.parse(session.blob);
+    assert.equal(after.turns.length, 0, "New chat wiped stored turns");
+    assert.equal(after.draft.hair, "silver_hair, long_hair", "sheet survives New chat");
+
+    const w4 = await mount({}, { session });
+    assert.ok(!byClass(w4.panel, "vnccs-ws-turn").some(t => (t.textContent || "").includes("Session restored")),
+        "fresh chat: nothing to restore");
+    assert.equal(w4.draftRow("Hair").children[1].value, "silver_hair, long_hair", "draft still restored");
+    w4.close();
+});

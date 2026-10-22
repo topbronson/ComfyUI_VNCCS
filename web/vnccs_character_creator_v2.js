@@ -1,6 +1,6 @@
 import { createStylePicker } from "./character_styles.mjs?v=style-mix-5";
 import { createSakuraInteractions } from "./sakura_interactions.mjs";
-import { openWizardWorkspace } from "./vnccs_wizard_workspace.mjs?v=ws-7";
+import { openWizardWorkspace } from "./vnccs_wizard_workspace.mjs?v=ws-8";
 import { app } from "../../scripts/app.js";
 window.__vnccsCreatorBuild = "queue-job-2026-10-21a";
 import { vnccsApi as api, mediaURL, checkedJSON, storage, refreshPreviewImage, watchConnection } from "./vnccs_transport.js";
@@ -3777,6 +3777,9 @@ app.registerExtension({
 
                 const openCharacterWizard = () => {
                     if (node._vnccsStateRestoreError) return;
+                    // Session (chat + sheet) persists per character across
+                    // close/reopen and reloads; key frozen at open time.
+                    const wizardSessionKey = `VNCCS_V2_WizardChat:${state.character || ""}`;
                     openWizardWorkspace({
                         node,
                         state,
@@ -3786,6 +3789,13 @@ app.registerExtension({
                         beginCharacterWizardRequest,
                         saveState,
                         ensureQwenVLReady,
+                        loadWizardSession: () => {
+                            try { return JSON.parse(storage.getItem(wizardSessionKey) || "null"); }
+                            catch { return null; }
+                        },
+                        saveWizardSession: (session) => {
+                            try { storage.setItem(wizardSessionKey, JSON.stringify(session)); } catch { /* best effort */ }
+                        },
                         // The workspace drafts a character name; on Apply it
                         // routes through these so creation/selection reuse the
                         // same guarded path as the node's own New Character.
