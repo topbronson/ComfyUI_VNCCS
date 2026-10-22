@@ -1051,9 +1051,10 @@ WIZARD_RULES_BLOCK = """Rules:
 - Put skin tone in skin_color, not race. "afro", "African", "African-American", "black", or similar means skin_color should be "dark skin" unless another skin tone is explicit.
 - For skin_color, do not guess a default. Use an empty string unless the user's idea explicitly mentions skin tone, complexion, or non-human skin color. Do not use "pale skin" as a fallback.
 - Do not describe clothing or outfit items.
+- Always fill additional_details: 3-6 short, vivid, comma-separated descriptive fragments (2-8 words each, NOT full sentences) that round out THIS character beyond the other fields — distinctive marks (freckles, a small scar, heterochromia accents), patterns or features specific to the species, small accessories and props (glasses, jewelry, hair ornaments, a signature item; main outfit items stay out), and visual quirks (sleepy half-lidded expression, ink-stained fingers). Make them concrete to the concept, never generic filler.
 - Do not add background, camera, pose, quality tags, style tags, nsfw, nudity, sex acts, or negative prompts.
 - Keep fields practical for the existing character form.
-- If a field is not needed, use an empty string."""
+- If a field is not needed, use an empty string (additional_details is never left empty when the concept supports detail)."""
 
 _ASSIST_INFLIGHT = set()
 

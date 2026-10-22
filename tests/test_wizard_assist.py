@@ -208,6 +208,24 @@ def test_tag_mode_token_budget_cap_and_placement():
 
 # --- _clean_assist_history / _clean_assist_draft -----------------------------
 
+def test_assist_prompts_require_rounded_additional_details():
+    from nodes.character_creator_v2 import _build_assist_prompts
+    post = {"description": "a quiet librarian girl", "history": [], "draft": None, "count": 5}
+    _, user_prompt = _build_assist_prompts("draft", post)
+    assert "Always fill additional_details" in user_prompt, "draft prompt must push concept-specific round-out details"
+    assert "comma-separated" in user_prompt and "NOT full sentences" in user_prompt
+    # safety rules must survive the enrichment guidance
+    assert "species/fantasy traits only" in user_prompt
+    assert "Do not guess a default" in user_prompt or "do not guess a default" in user_prompt
+    assert "Do not describe clothing" in user_prompt
+    # the shared block reaches the other assist actions too
+    draft = {"sex": "female", "age": 20, "race": "human", "skin_color": "", "body": "slim",
+             "face": "", "hair": "brown_hair", "eyes": "brown eyes", "additional_details": ""}
+    for action in ("reroll_field", "polish_field", "review", "names", "edit_command"):
+        _, up = _build_assist_prompts(action, {"draft": draft, "field": "hair",
+                                               "instruction": "x", "count": 3})
+        assert "Always fill additional_details" in up, f"{action} must share the rules block"
+
 def test_clean_history_bounds_roles_and_drops_junk():
     turns = [{"role": "assistant", "text": "ok"}, "junk", {"role": "USER", "text": "  hi\x07 "},
              {"role": "user", "text": ""}, {"text": "no role -> user"}, {"role": "x", "text": "y"}]
