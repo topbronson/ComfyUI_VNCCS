@@ -376,20 +376,48 @@ export async function openWizardWorkspace(ctx) {
     const newChatBtn = document.createElement("button");
     newChatBtn.className = "vnccs-ws-chip ghost";
     newChatBtn.textContent = "New chat";
-    newChatBtn.title = "Clear the assistant chat (the draft sheet stays)";
+    newChatBtn.title = "Clear the chat AND reset the draft sheet to the node's saved values — the assist model starts from zero context for this character.";
     newChatBtn.addEventListener("click", () => {
+        // "Fresh context" means the model sees nothing from the previous
+        // working session: chat cleared AND the sheet re-seeded from the
+        // node's on-disk character (the draft JSON is always sent as the
+        // model's current-draft context, so leaving edits in place leaked
+        // the previously-worked character into new conversations).
         draftConvo.length = 0;
-        persistSession("turns");
         msgs.innerHTML = ""; // Safe: constant-string child clear (no external content).
-        infoTurn("New chat — the designer starts fresh; your draft sheet is unchanged.");
+        draft = seedDraft(state.character_info || {});
+        experimentTags = seedExperimentTags();
+        dirty = false;
+        renderDraftSheet();
+        renderExpRow();
+        persistSession("all");
+        infoTurn("New chat — conversation cleared and the sheet reset to the node's saved values. The designer now sees only what's on disk.");
     });
     toolbar.appendChild(newChatBtn);
+
+    const freshCharBtn = document.createElement("button");
+    freshCharBtn.className = "vnccs-ws-chip ghost";
+    freshCharBtn.textContent = "Fresh char";
+    freshCharBtn.title = "True blank slate: clear the chat and wipe every draft-sheet field (and experiment tags), no matter what the node has loaded. Ideal for inventing a brand-new character.";
+    freshCharBtn.addEventListener("click", () => {
+        draftConvo.length = 0;
+        msgs.innerHTML = ""; // Safe: constant-string child clear (no external content).
+        draft = seedDraft({}); // sex=female/age=18 defaults, all text fields empty
+        experimentTags = [];
+        dirty = false;
+        renderDraftSheet();
+        renderExpRow();
+        persistSession("all");
+        infoTurn("Fresh character — chat cleared and the sheet wiped blank. The assist model starts from an empty draft; describe who you want.");
+    });
+    toolbar.appendChild(freshCharBtn);
 
     // ---- session persistence -------------------------------------------------
     // The workspace survives close/reopen (and page reloads): chat, draft
     // sheet and experiment tags are stored per character through the node's
-    // scoped storage. “New chat” intentionally starts a fresh conversation;
-    // “Reset from node” reloads the sheet from the node.
+    // scoped storage. “New chat” starts fresh context (chat + sheet re-seeded
+    // from the node); “Fresh char” additionally blanks the sheet entirely;
+    // “Reset from node” reloads only the sheet from the node.
     const PERSIST_TURNS_MAX = 24;
     const PERSIST_TEXT_CAP = 800;
     function persistSlim(turn) {
