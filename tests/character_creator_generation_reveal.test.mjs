@@ -51,7 +51,7 @@ test("Creator generation uses the gender mannequin, then reveals the new preview
     const context = vm.createContext({
         api, els, state: { character: "Kai", character_info: { sex: "male" } }, node,
         registerCleanup() {}, CHARACTER_MANNEQUIN_URL: "female.png", CHARACTER_MANNEQUIN_MALE_URL: "male.png",
-        beginPreviewRequest: () => () => true, mediaURL: value => value,
+        beginPreviewRequest: () => () => true, beginStyleViewRequest: () => () => true, mediaURL: value => value,
         clearPreviewHandlers() {}, hideSpriteNav() {}, setPreviewLoading() {}, saveState() {},
         window: { matchMedia: () => ({ matches: false }), requestAnimationFrame: callback => callback() },
     });

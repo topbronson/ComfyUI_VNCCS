@@ -1687,6 +1687,12 @@ app.registerExtension({
                 if (dataWidget) dataWidget.hidden = true;
 
                 const beginPreviewRequest = createRequestGuard(node);
+                // Style previews are a side-glance: they must NEVER steal the
+                // generation guard (a style click mid-generation would otherwise
+                // abort the generated reveal via !ownsRequest() and leave the
+                // stale image on screen). Authoritative presenters (generate,
+                // reveal, cache refresh, clear) kill pending style views instead.
+                const beginStyleViewRequest = createRequestGuard(node);
                 const state = {
                     preview_valid: false, // Smart Cache Flag
                     preview_source: "gen", // "gen" or "pose" - tracks what user sees
@@ -2292,6 +2298,7 @@ app.registerExtension({
                     beginCharacterRequest();
                     beginCharacterWizardRequest();
                     beginPreviewRequest();
+                    beginStyleViewRequest();
                     state.character = "";
                     if (els.charSelect) els.charSelect.value = "";
                     restoredWidgetInfoCharacter = null;
@@ -2317,6 +2324,7 @@ app.registerExtension({
 
                 const tryCachePreview = (character) => {
                     const currentRequest = beginPreviewRequest();
+                    beginStyleViewRequest();
                     const isCurrent = () => currentRequest() && state.character === character;
                     console.log("[VNCCS] Trying to load cached preview...");
                     const cacheUrl = mediaURL(`/vnccs/get_cached_preview?character=${encodeURIComponent(character)}&t=${Date.now()}`);
@@ -2361,7 +2369,7 @@ app.registerExtension({
                     if (!state.character || !els.previewImg) return;
                     const character = state.character;
                     const styleLabel = String(state.character_info?.style_label || state.character_info?.style || "").trim();
-                    const currentRequest = beginPreviewRequest();
+                    const currentRequest = beginStyleViewRequest();
                     const isCurrent = () => currentRequest() && state.character === character;
                     const showBlank = () => {
                         setPreviewLoading(false);
@@ -5023,6 +5031,7 @@ app.registerExtension({
                     if (!workflow || workflow.character !== character || state.character !== character) return null;
                     if (workflow.promise) return workflow.promise;
                     const currentRequest = beginPreviewRequest();
+                    beginStyleViewRequest();
                     const cacheUrl = mediaURL(`/vnccs/get_cached_preview?character=${encodeURIComponent(character)}&t=${Date.now()}`);
                     clearPreviewHandlers();
                     hideSpriteNav();
@@ -5132,6 +5141,7 @@ app.registerExtension({
 
                     const character = state.character;
                     const currentPreview = beginPreviewRequest();
+                    beginStyleViewRequest();
                     // LOCAL HOT-PATCH (re-ported to 3.3.0 2026-10-20): resolve the
                     // upstream VNCCS_ControlCenter node (same walkback pattern as
                     // clothes_designer) so the preview endpoint can reuse the live

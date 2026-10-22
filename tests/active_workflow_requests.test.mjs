@@ -208,12 +208,12 @@ function creatorImageHarness() {
         showAlertModal() { assert.fail('Unexpected model validation error'); },
         isSelectedCcAssetInstalled: () => true,
         saveCurrentGenerationModeValues() {}, createLoadingOverlay: () => ({ remove() {} }),
-        showMessage() { assert.fail('Stale generation error surfaced'); },
+        showMessage(m, m2) { assert.fail('Stale generation error surfaced: ' + (typeof m2 === 'string' ? m2 : m)); },
         api: { fetchApi: (route, options) => { const task = deferred(); task.route = route; task.options = options; requests.push(task); return task.promise; } },
     });
     const text = source('vnccs_character_creator_v2');
     const previewButton = between(text, 'let previewRunning = false;', 'const beginWorkflowStatusRequest =');
-    vm.runInContext(`${guardCode}\nconst beginPreviewRequest = createRequestGuard(node);\n${previewButton}\nworkflowBusy = false;\n${between(text, 'const clearCharacterSelection =', 'const applyStoredPrefs =')}\n${between(text, 'const beginCharacterRequest =', 'const doGenerate = async')}\n${between(text, 'const doGenerate = async', '// 7. Graph Restore Hook')}\nglobalThis.preview = { showSpritePreview, tryCachePreview, showStyleCachedPreview, clearCharacterSelection, doGenerate, loadChar };`, context);
+    vm.runInContext(`${guardCode}\nconst beginPreviewRequest = createRequestGuard(node);\nconst beginStyleViewRequest = createRequestGuard(node);\n${previewButton}\nworkflowBusy = false;\n${between(text, 'const clearCharacterSelection =', 'const applyStoredPrefs =')}\n${between(text, 'const beginCharacterRequest =', 'const doGenerate = async')}\n${between(text, 'const doGenerate = async', '// 7. Graph Restore Hook')}\nglobalThis.preview = { showSpritePreview, tryCachePreview, showStyleCachedPreview, clearCharacterSelection, doGenerate, loadChar };`, context);
     return { context, state, node, els, images, saved, requests, ...context.preview };
 }
 
@@ -283,6 +283,32 @@ test('creator shows the newest cached style preview on style change and blanks u
     const before = h.els.previewImg.src;
     h.images[2].onload();
     assert.equal(h.els.previewImg.src, before, 'a stale style callback must be ignored');
+});
+
+test('a style glance cannot hijack the generation-owned preview guard', () => {
+    const h = creatorImageHarness();
+    h.state.character_info = { style: 'anime', style_label: 'Anime Style' };
+    h.showStyleCachedPreview();          // images[0] = style loader, still pending
+    h.tryCachePreview('Alice');          // authoritative presenter supersedes it
+    h.images[1].onload();                // cache preview presents
+    h.images[0].onload();                // late style callback must be ignored
+    assert.match(h.els.previewImg.src, /get_cached_preview/);
+});
+
+test('a style click during a running generation does not suppress the generated reveal', async () => {
+    const h = creatorImageHarness();
+    h.context.setTimeout = (fn) => { fn(); return 0; };
+    h.context.clearTimeout = () => {};
+    h.context.URLSearchParams = URLSearchParams;
+    h.state.character_info = { style: 'anime', style_label: 'Anime Style' };
+    const generation = h.doGenerate();
+    h.showStyleCachedPreview();          // user glances at another style while waiting
+    h.images[0].onload();                // style loader resolves mid-generation
+    h.requests[0].resolve(response({ prompt_id: 'p1' }));
+    await new Promise(resolve => setImmediate(resolve));
+    h.requests[1].resolve(response({ p1: { status: { status_str: 'success', completed: true }, outputs: { preview_job: { ui: { images: [{ filename: 'gen.png', subfolder: 's', type: 'output' }] } } } } }));
+    await generation;
+    assert.match(h.els.previewImg.src, /\/view\?filename=gen\.png/, 'the just-generated image must replace the style glance');
 });
 
 test('creator rejects an old pose callback after current cache preview succeeds', () => {

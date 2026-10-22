@@ -395,6 +395,7 @@ for (const kind of ['creator', 'cloner']) {
                     between(text, 'const beginCharacterRequest =', 'const doCreate =');
             vm.runInContext(`${guards}
                 const beginPreviewRequest = createRequestGuard(node);
+            const beginStyleViewRequest = createRequestGuard(node);
                 ${loaders}
                 globalThis.loadInventory = ${kind === 'creator' ? 'init' : 'loadCharList'};`, h.context);
             h.dataWidget.value = JSON.stringify({ character: 'Alice', character_info: { name: 'Alice', hair: 'authored Alice hair' },
@@ -464,6 +465,7 @@ for (const kind of ['creator', 'cloner']) {
                 between(text, 'const beginCharacterRequest =', 'const doCreate =');
         vm.runInContext(`${guards}
             const beginPreviewRequest = createRequestGuard(node);
+            const beginStyleViewRequest = createRequestGuard(node);
             ${loaders}
             globalThis.loadInventory = ${kind === 'creator' ? 'init' : 'loadCharList'};
             globalThis.loadCharacter = loadChar;`, context);
