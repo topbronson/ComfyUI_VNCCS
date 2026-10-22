@@ -274,7 +274,6 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
                 title: "Filter the library to this set (click again to clear)",
                 onClick: async () => { setFilter = setFilter === name ? "" : name; refreshLibrary(); refreshPopover(); },
             });
-            items.push({ label: `▶ Generate previews: ${name} (${count})`, title: "Queue every style in this set with the current Creator settings, like pressing Generate preview for each.", onClick: () => runStyleSet(name) });
             items.push({ label: `Rename ${name}…`, onClick: () => askText({
                 title: `Rename set “${name}”`, submitText: "Rename", initial: name,
                 onSubmit: async value => {
@@ -341,6 +340,14 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
         setsBtn.title = "Style sets: create sets, add styles from each card's Sets button, then filter, rename, delete, or queue a preview run for a set.";
         setsBtn.onclick = () => { if (batch || deleting || !editor.hidden) return; openSetsMenu(setsBtn); };
         setsBtn.hidden = editingSecondary;
+        const batchBtn = make("button", "vnccs-creator-btn", "Batch Set Previews");
+        batchBtn.title = "Queue preview renders for every style in the set currently selected in the Sets menu, using the current Creator settings. While a run is active this button stops it after the current image.";
+        batchBtn.onclick = () => {
+            if (batch || deleting || !editor.hidden) { if (batch) runStyleSet(setFilter); return; }
+            if (!setFilter) { setStatus("Pick a set in the Sets menu first, then batch its previews with the current Creator settings."); return; }
+            runStyleSet(setFilter);
+        };
+        batchBtn.hidden = editingSecondary;
         const add = make("button", "vnccs-creator-btn", "New style");
         const generateAll = make("button", "vnccs-creator-btn", "Generate all previews");
         generateAll.title = "Render every library style sequentially using current Creator settings and resolution scale. Stop finishes the current image.";
@@ -348,7 +355,7 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
         const dismiss = make("button", "vnccs-creator-btn", "Close");
         dismiss.title = "Close the library and stop after the current preview";
         dismiss.onclick = () => close();
-        header.append(search, filter, setsBtn, add, generateAll, dismiss);
+        header.append(search, filter, setsBtn, batchBtn, add, generateAll, dismiss);
         const sizeControls = make("label", "vnccs-style-size-controls", "Card size");
         const sizeSlider = make("input", "vnccs-style-size-slider");
         sizeSlider.type = "range";
@@ -402,6 +409,8 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
             add.disabled = !editor.hidden || !!batch || deleting;
             generateAll.textContent = batch ? (batch.cancelled ? "Stopping..." : "Stop after current") : "Generate all previews";
             generateAll.disabled = loadingCatalog || deleting || !editor.hidden || !!batch?.cancelled;
+            batchBtn.textContent = batch ? (batch.cancelled ? "Stopping..." : "Stop batch") : "Batch Set Previews";
+            batchBtn.disabled = loadingCatalog || deleting || !editor.hidden || !setFilter || !!batch?.cancelled;
             if (batch) closePopover();
             for (const tileHost of [grid, favGrid]) {
                 for (const edit of tileHost.querySelectorAll(".vnccs-style-edit")) edit.disabled = !!batch || deleting;
