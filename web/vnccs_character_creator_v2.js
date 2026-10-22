@@ -1,6 +1,6 @@
 import { createStylePicker } from "./character_styles.mjs?v=style-mix-5";
 import { createSakuraInteractions } from "./sakura_interactions.mjs";
-import { openWizardWorkspace } from "./vnccs_wizard_workspace.mjs?v=ws-1";
+import { openWizardWorkspace } from "./vnccs_wizard_workspace.mjs?v=ws-2";
 import { app } from "../../scripts/app.js";
 window.__vnccsCreatorBuild = "queue-job-2026-10-21a";
 import { vnccsApi as api, mediaURL, checkedJSON, storage, refreshPreviewImage, watchConnection } from "./vnccs_transport.js";

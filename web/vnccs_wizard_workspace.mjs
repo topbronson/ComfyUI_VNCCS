@@ -36,7 +36,7 @@ const CSS = `
 .vnccs-ws-flash { animation: vnccsWsFlash .7s ease; }
 @keyframes vnccsWsFlash { 0% { box-shadow: 0 0 0 2px #7fd08a; } 100% { box-shadow: none; } }
 .vnccs-ws-grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-.vnccs-ws-console { border-left: 1px solid #33333f; padding-left: 12px; }
+.vnccs-ws-console { border-right: 1px solid #33333f; padding-right: 12px; }
 .vnccs-ws-msgs { flex: 1; overflow: auto; display: flex; flex-direction: column; gap: 8px;
   min-height: 0; padding-right: 4px; }
 .vnccs-ws-turn { border-radius: 8px; padding: 7px 10px; max-width: 96%; }
@@ -78,7 +78,7 @@ const TEXT_FIELDS = [
 ];
 
 const MODES = [
-    { id: "draft", label: "Draft", needsText: true, placeholder: "Describe the character broadly… e.g. a timid swamp witch who collects buttons" },
+    { id: "draft", label: "Draft", needsText: true, placeholder: "Chat with the designer — e.g. \u201cmake me a character based on an Egyptian god\u201d, then keep asking for changes" },
     { id: "reroll_field", label: "Reroll field", needsField: true, needsText: false, placeholder: "Optional steer: 'something more exotic'…" },
     { id: "polish_field", label: "Polish field", needsField: true, needsText: false, placeholder: "Optional steer: 'more vivid, keep the concept'…" },
     { id: "edit_command", label: "Fix…", needsText: true, placeholder: "Tell the AI what to change… e.g. make her older and add a scar" },
@@ -144,7 +144,7 @@ export async function openWizardWorkspace(ctx) {
     draftPane.className = "vnccs-ws-pane";
     const consolePane = document.createElement("div");
     consolePane.className = "vnccs-ws-pane vnccs-ws-console";
-    body.append(draftPane, consolePane);
+    body.append(consolePane, draftPane);
     panel.appendChild(body);
 
     // ---- draft sheet --------------------------------------------------------
@@ -293,6 +293,7 @@ export async function openWizardWorkspace(ctx) {
     const toolbar = document.createElement("div");
     toolbar.className = "vnccs-ws-toolbar";
     let activeMode = MODES[0];
+    const draftConvo = [];   // chat history for the Draft action only
     const modeBtns = {};
     const fieldSel = document.createElement("select");
     fieldSel.style.display = "none";
@@ -315,6 +316,16 @@ export async function openWizardWorkspace(ctx) {
         modeBtns[m.id] = b;
         toolbar.appendChild(b);
     }
+    const newChatBtn = document.createElement("button");
+    newChatBtn.className = "vnccs-ws-chip ghost";
+    newChatBtn.textContent = "New chat";
+    newChatBtn.title = "Clear the assistant chat (the draft sheet stays)";
+    newChatBtn.addEventListener("click", () => {
+        draftConvo.length = 0;
+        msgs.innerHTML = ""; // Safe: constant-string child clear (no external content).
+        infoTurn("New chat — the designer starts fresh; your draft sheet is unchanged.");
+    });
+    toolbar.appendChild(newChatBtn);
     toolbar.appendChild(fieldSel);
     consolePane.appendChild(toolbar);
 
@@ -385,7 +396,12 @@ export async function openWizardWorkspace(ctx) {
         if (activeMode.needsText && !text) { inputEl.focus(); return; }
         const payload = { action: activeMode.id, node_id: node.id, request_id: newRequestId() };
         let action = activeMode.id;
-        if (action === "draft") payload.description = text;
+        if (action === "draft") {
+            payload.description = text;
+            payload.history = draftConvo.slice(-12);
+            payload.draft = { ...draft };
+            draftConvo.push({ role: "user", text });
+        }
         else if (action === "reroll_field" || action === "polish_field") {
             payload.field = fieldSel.value; payload.instruction = text; payload.draft = { ...draft };
         } else if (action === "edit_command") { payload.instruction = text; payload.draft = { ...draft }; }
@@ -443,7 +459,24 @@ export async function openWizardWorkspace(ctx) {
     function renderResult(action, payload, data, meta) {
         if (action === "draft") {
             const t = turn("model");
-            t.textContent = "Draft ready:";
+            const rationale = data.rationale
+                ? String(data.rationale)
+                : "Draft ready:";
+            t.textContent = rationale;
+            if (data.rationale) {
+                const kv0 = document.createElement("div");
+                kv0.className = "vnccs-ws-kv";
+                kv0.textContent = "Proposed fields:";
+                kv0.style.marginTop = "6px";
+                kv0.style.opacity = ".7";
+                t.appendChild(kv0);
+            }
+            draftConvo.push({
+                role: "assistant",
+                text: (data.rationale ? data.rationale + " " : "")
+                    + "[current draft] " + ["sex", "age", "race", "skin_color", "body", "face", "hair", "eyes", "additional_details"]
+                        .map(k => `${k}=${data[k] ?? ""}`).join("; "),
+            });
             const kv = document.createElement("div");
             kv.className = "vnccs-ws-kv";
             kv.textContent = ["sex", "age", "race", "skin_color", "body", "face", "hair", "eyes", "additional_details"]

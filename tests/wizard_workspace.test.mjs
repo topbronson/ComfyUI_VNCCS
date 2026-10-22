@@ -105,6 +105,7 @@ const DRAFT_AI = {
     sex: "female", age: 21, race: "foxfolk", skin_color: "pale skin",
     body: "slim build", face: "sharp eyes", hair: "silver_hair",
     eyes: "amber eyes", additional_details: "hair clips", evil_extra: "no",
+    rationale: "I drew on the fox-variant shrine maiden archetype, picked foxfolk for coherent ears, and kept pale skin because you mentioned moonlight.",
 };
 
 function makeApi(t) {
@@ -177,8 +178,11 @@ test.afterEach(() => { fakeDocument.body.children.length = 0; });
 
 // ── tests ────────────────────────────────────────────────────────────────────
 
-test("mount: split view, six modes, footer, backend badge, seeded draft, node untouched", async () => {
+test("mount: console left, draft right, six modes, footer, backend badge, seeded draft, node untouched", async () => {
     const w = await mount();
+    const panes = byClass(w.panel, "vnccs-ws-pane");
+    assert.ok(panes[0]._classes.has("vnccs-ws-console"), "AI console is the left pane");
+    assert.ok(!panes[1]._classes.has("vnccs-ws-console"), "draft sheet is the right pane");
     assert.equal(byClass(w.panel, "vnccs-ws-mode").length, 6);
     assert.ok(findText(w.panel, "Draft") && findText(w.panel, "Fix…") && findText(w.panel, "Review"));
     assert.ok(findText(w.panel, "Reset from node") && findText(w.panel, "Cancel") && findText(w.panel, "Apply & Close"));
@@ -249,6 +253,37 @@ test("edit_command Apply all updates sheet; Reset restores node values", async (
     assert.equal(w.applied.length, 0);
     fire(findText(w.panel, "Reset from node"), "click");
     assert.equal(w.draftRow("Hair").children[1].value, "green_hair");
+});
+
+test("draft chat: multi-turn history, rationale bubble, New chat reset", async () => {
+    const w = await mount();
+    w.input().value = "make me a character based on an Egyptian god";
+    fire(w.send(), "click");
+    await settle();
+    let calls = w.t.requests.filter(r => r.route === "/vnccs/wizard/assist").map(r => JSON.parse(r.options.body));
+    assert.equal(calls[0].action, "draft");
+    assert.deepEqual(calls[0].history, [], "first turn has empty history");
+    assert.equal(calls[0].draft.hair, "green_hair", "current sheet travels with the chat");
+    const bubble = findAll(w.panel, e => (e.textContent || "").startsWith("I drew on the fox-variant"));
+    assert.ok(bubble.length, "rationale renders as the assistant reply");
+
+    w.input().value = "make her younger and friendlier";
+    fire(w.send(), "click");
+    await settle();
+    calls = w.t.requests.filter(r => r.route === "/vnccs/wizard/assist").map(r => JSON.parse(r.options.body));
+    assert.equal(calls.length, 2);
+    const hist = calls[1].history;
+    assert.deepEqual(hist.map(h => h.role), ["user", "assistant"], "back-and-forth carries roles in order");
+    assert.equal(hist[0].text, "make me a character based on an Egyptian god");
+    assert.ok(hist[1].text.includes("[current draft]"), "assistant turn carries the draft for continuity");
+    assert.ok(hist[1].text.includes("foxfolk"));
+
+    fire(findText(w.panel, "New chat"), "click");
+    w.input().value = "start over, a desert cartographer";
+    fire(w.send(), "click");
+    await settle();
+    calls = w.t.requests.filter(r => r.route === "/vnccs/wizard/assist").map(r => JSON.parse(r.options.body));
+    assert.deepEqual(calls[2].history, [], "New chat starts the designer fresh");
 });
 
 test("names and review render sanitized chips; accept applies suggestion", async () => {

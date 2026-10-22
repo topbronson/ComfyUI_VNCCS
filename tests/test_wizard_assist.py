@@ -19,6 +19,8 @@ from nodes.character_creator_v2 import (
     CHARACTER_PRESETS,
     RACE_OPTION_TAGS,
     SKIN_COLOR_OPTIONS,
+    _clean_assist_draft,
+    _clean_assist_history,
     _clean_assist_issues,
     _clean_assist_patch,
     _sanitize_assist_names,
@@ -97,6 +99,44 @@ def test_validate_caps_each_draft_field():
     post, err = _validate_assist_request({"action": "names", "draft": draft})
     assert err is None
     assert len(post["draft"]["additional_details"]) == 400
+
+
+# --- _clean_assist_history / _clean_assist_draft -----------------------------
+
+def test_clean_history_bounds_roles_and_drops_junk():
+    turns = [{"role": "assistant", "text": "ok"}, "junk", {"role": "USER", "text": "  hi\x07 "},
+             {"role": "user", "text": ""}, {"text": "no role -> user"}, {"role": "x", "text": "y"}]
+    out = _clean_assist_history(turns)
+    assert out == [{"role": "assistant", "text": "ok"}, {"role": "user", "text": "hi"},
+                   {"role": "user", "text": "no role -> user"}, {"role": "user", "text": "y"}]
+    bounded = _clean_assist_history([{"role": "user", "text": f"t{i}"} for i in range(12)])
+    assert len(bounded) == 8 and bounded[0]["text"] == "t4" and bounded[-1]["text"] == "t11"
+    assert _clean_assist_history([{"role": "user", "text": "z" * 2000}])[0]["text"] == "z" * 800
+    assert _clean_assist_history("not a list") == []
+
+
+def test_draft_action_accepts_history_and_draft():
+    post, err = _validate_assist_request({
+        "action": "draft", "description": "anubis scholar",
+        "history": [{"role": "user", "text": "earlier idea"}],
+        "draft": {"sex": "MALE", "age": "300", "hair": "x\x00y", "extra": "drop me"},
+    })
+    assert err is None
+    assert post["history"] == [{"role": "user", "text": "earlier idea"}]
+    assert post["draft"]["sex"] == "male" and post["draft"]["age"] == 100
+    assert post["draft"]["hair"] == "xy" and "extra" not in post["draft"]
+
+
+def test_draft_action_rejects_bad_draft_and_keeps_none():
+    assert _validate_assist_request({"action": "draft", "description": "d", "draft": 5})[1] is not None
+    post, err = _validate_assist_request({"action": "draft", "description": "d"})
+    assert err is None and post["draft"] is None and post["history"] == []
+
+
+def test_clean_assist_draft_errors():
+    assert _clean_assist_draft("nope") == (None, "draft must be an object")
+    clean, err = _clean_assist_draft({"sex": "f"})
+    assert err is None and clean["sex"] == "female" and clean["age"] == 18
 
 
 # --- _sanitize_assist_value ---------------------------------------------------

@@ -968,6 +968,38 @@ def _sanitize_assist_names(value, count):
     return kept
 
 
+def _clean_assist_history(value):
+    """Sanitize the client's draft-conversation turns (bounded tail)."""
+    history = []
+    for item in (value if isinstance(value, list) else [])[-8:]:
+        if not isinstance(item, dict):
+            continue
+        role = "assistant" if str(item.get("role", "")).lower() == "assistant" else "user"
+        text = _clean_assist_text(item.get("text", ""))[:800]
+        if text:
+            history.append({"role": role, "text": text})
+    return history
+
+
+def _clean_assist_draft(draft):
+    """Coerce a client-sent draft into the explicit contract shape.
+    Returns (clean_draft, error)."""
+    if not isinstance(draft, dict):
+        return None, "draft must be an object"
+    sex = _clean_assist_text(draft.get("sex", "female")).lower()
+    sex = "male" if sex.startswith("m") else "female"
+    try:
+        age = max(1, min(100, int(float(draft.get("age", 18)))))
+    except (TypeError, ValueError):
+        age = 18
+    clean = {"sex": sex, "age": age}
+    for key in ASSIST_TEXT_FIELDS:
+        clean[key] = _clean_assist_text(draft.get(key, ""))[:400]
+    if len(json.dumps(clean, ensure_ascii=False)) > ASSIST_MAX_DRAFT_JSON:
+        return None, "draft too large"
+    return clean, None
+
+
 def _clean_assist_patch(raw_patch, draft, ctx):
     """edit_command patch filter (module-level so tests can pin it)."""
     if not isinstance(raw_patch, dict):
@@ -1026,22 +1058,19 @@ def _validate_assist_request(post):
             return None, "No character description provided"
         if len(description) > ASSIST_MAX_INSTRUCTION:
             return None, "description too long"
+        post = dict(post)
         post["description"] = description
+        post["history"] = _clean_assist_history(post.get("history"))
+        if post.get("draft") is None:
+            post["draft"] = None
+        else:
+            post["draft"], err = _clean_assist_draft(post["draft"])
+            if err:
+                return None, err
         return post, None
-    draft = post.get("draft")
-    if not isinstance(draft, dict):
-        return None, "draft must be an object"
-    sex = _clean_assist_text(draft.get("sex", "female")).lower()
-    sex = "male" if sex.startswith("m") else "female"
-    try:
-        age = max(1, min(100, int(float(draft.get("age", 18)))))
-    except (TypeError, ValueError):
-        age = 18
-    clean_draft = {"sex": sex, "age": age}
-    for key in ASSIST_TEXT_FIELDS:
-        clean_draft[key] = _clean_assist_text(draft.get(key, ""))[:400]
-    if len(json.dumps(clean_draft, ensure_ascii=False)) > ASSIST_MAX_DRAFT_JSON:
-        return None, "draft too large"
+    clean_draft, err = _clean_assist_draft(post.get("draft"))
+    if err:
+        return None, err
     post = dict(post)
     post["draft"] = clean_draft
     if action in ("reroll_field", "polish_field"):
@@ -1066,10 +1095,36 @@ def _build_assist_prompts(action, post):
         "character draft form. Output valid JSON only."
     )
     if action == "draft":
-        # Exact parity with the one-shot wizard prompt.
-        return _build_character_wizard_prompts(
-            post["description"], _extract_character_tag_options(CHARACTER_PRESETS)
+        # Conversational drafting chat: multi-turn continuity plus a design
+        # rationale the user can read. (The one-shot /vnccs/character_wizard
+        # route keeps its own strict parity prompt.)
+        system_prompt = (
+            "You are a professional anime/game character designer collaborating with a user "
+            "in a drafting chat. You refine the same character across turns. Output valid JSON only."
         )
+        history_block = "".join(
+            f"\n{msg['role'].upper()}: {msg['text']}" for msg in post.get("history", [])
+        )
+        draft_block = ""
+        if post.get("draft"):
+            draft_block = (
+                "\nCurrent character draft as it stands right now (JSON): "
+                f"{json.dumps(post['draft'], ensure_ascii=False)}\n"
+            )
+        tag_options = json.dumps(_extract_character_tag_options(CHARACTER_PRESETS), ensure_ascii=False)
+        user_prompt = f"""{history_block}
+{draft_block}
+The user's latest message: {post['description']}
+
+Produce the complete updated character as ONE JSON object with exactly these keys:
+{{"sex": "...", "age": ..., "race": "...", "skin_color": "...", "body": "...", "face": "...", "hair": "...", "eyes": "...", "additional_details": "...", "rationale": "..."}}
+- sex is "female" or "male"; age is a number.
+- Fill EVERY field. Keep continuity with the earlier turns and the current draft; change only what the latest message asks (or clearly implies).
+- "rationale": 2-4 plain sentences addressed to the user explaining the decisions you made and WHY — what you drew from their idea (e.g. the mythology behind a requested deity), what you chose between alternatives, and which curated preset tags you used.
+
+{WIZARD_RULES_BLOCK}
+- Curated presets you may draw from: {tag_options}"""
+        return system_prompt, user_prompt
     draft = post["draft"]
     instruction = post.get("instruction", "")
     extra = f"\nExtra instruction from the user: {instruction}\n" if instruction else ""
@@ -2440,6 +2495,9 @@ if server:
                         "assist_timeout",
                         min(ASSIST_REMOTE_TIMEOUT_DEFAULT, float(backend.get("timeout", 120))),
                     ))
+                    if action == "draft":
+                        # JSON + design rationale needs more room than the other actions.
+                        assist_backend["max_tokens"] = max(int(backend.get("max_tokens", 900)), 1400)
                     content, model_used = _wizard_via_remote(system_prompt, user_prompt, assist_backend)
                     log_event("wizard_assist", component="Creator", action=action, model=model_used,
                               elapsed=round(time.time() - started, 1), truncate=False)
@@ -2496,7 +2554,7 @@ if server:
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
                     ],
-                    max_tokens=900,
+                    max_tokens=1400 if action == "draft" else 900,
                     temperature=0.3,
                 )
                 content = response["choices"][0]["message"]["content"]
@@ -2504,14 +2562,19 @@ if server:
 
             log_stage("parsing_description")
             if action == "draft":
-                parsed = _parse_character_wizard_json(content or "")
+                raw_parsed = parse_wizard_json(content or "")
+                parsed = normalize_character_wizard_traits(raw_parsed) if raw_parsed is not None else None
                 if parsed is None:
                     return web.json_response({
                         "error": "PARSE_ERROR",
                         "message": "Failed to parse Character Wizard JSON output.",
                         "raw": content or "",
                     }, status=500)
+                # rationale lives outside the 9-key contract: take it from the
+                # raw parse before trait normalization strips unknown keys.
+                rationale = _clean_assist_text(raw_parsed.get("rationale", ""))[:1200]
                 parsed = postprocess_character_wizard_result(parsed, post["description"])
+                parsed["rationale"] = rationale
                 return web.json_response(parsed)
 
             parsed = parse_wizard_json(content or "")
