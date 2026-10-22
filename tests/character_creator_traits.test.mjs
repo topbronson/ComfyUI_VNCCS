@@ -227,6 +227,10 @@ test("legacy body values and wizard output restore into the separate breast fiel
     assert.equal(context.els.breast_size.value, "medium_breasts");
     context.wizard({ sex: "male", body: "broad shoulders" });
     assert.equal(section.disabled, true);
+    // Legacy wizard payloads carry no breast_size key: the field is preserved,
+    // never silently wiped. An explicit "" (workspace clear) still applies.
+    assert.equal(state.character_info.breast_size, "medium_breasts");
+    context.wizard({ sex: "male", body: "broad shoulders", breast_size: "" });
     assert.equal(state.character_info.breast_size, "");
     context.wizard({ sex: "female", body: "small breasts, athletic build" });
     assert.equal(section.disabled, false);

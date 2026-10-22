@@ -1,5 +1,6 @@
 import { createStylePicker } from "./character_styles.mjs?v=style-mix-5";
 import { createSakuraInteractions } from "./sakura_interactions.mjs";
+import { openWizardWorkspace } from "./vnccs_wizard_workspace.mjs?v=ws-1";
 import { app } from "../../scripts/app.js";
 window.__vnccsCreatorBuild = "queue-job-2026-10-21a";
 import { vnccsApi as api, mediaURL, checkedJSON, storage, refreshPreviewImage, watchConnection } from "./vnccs_transport.js";
@@ -3715,7 +3716,9 @@ app.registerExtension({
                         ? (String(data.sex).toLowerCase().startsWith("m") ? "male" : "female")
                         : state.character_info.sex;
                     return animateWizardRows(rowKeys.map(key => els._wizardRows?.[key]), () => {
-                        state.character_info.breast_size = data.breast_size || "";
+                        // Preserve an existing breast_size when the source payload
+                        // (e.g. the one-shot wizard) does not carry the field.
+                        state.character_info.breast_size = data.breast_size ?? state.character_info.breast_size ?? "";
                         if (data.sex) {
                             state.character_info.sex = sex;
                             els.sex?.setValue?.(sex);
@@ -3741,7 +3744,7 @@ app.registerExtension({
                 };
 
                 const showCharacterWizardError = (err) => {
-                    showModal("Character Wizzard Error", () => {
+                    showModal("Character Wizard Error", () => {
                         const d = document.createElement("div");
                         d.className = "vnccs-creator-character-wizard-modal";
                         const text = document.createElement("div");
@@ -3774,68 +3777,16 @@ app.registerExtension({
 
                 const openCharacterWizard = () => {
                     if (node._vnccsStateRestoreError) return;
-                    const character = state.character;
-                    const currentRequest = beginCharacterWizardRequest();
-                    let input;
-                    showModal("Character Wizzard", () => {
-                        const wrap = document.createElement("div");
-                        wrap.className = "vnccs-creator-character-wizard-modal";
-                        const text = document.createElement("div");
-                        text.className = "vnccs-creator-character-wizard-modal-text";
-                        text.innerText = "Describe the character in a broad way. The model will expand it into the creator fields and prefer tags from the tag constructor.";
-                        input = document.createElement("textarea");
-                        input.className = "vnccs-creator-textarea";
-                        input.placeholder = "e.g. adult demon girl with long white hair, red eyes, elegant sharp face";
-                        wrap.append(text, input);
-                        setTimeout(() => input.focus(), 50);
-                        return wrap;
-                    }, [
-                        { text: "Cancel" },
-                        {
-                            text: "FILL FIELDS",
-                            class: "vnccs-creator-btn-primary",
-                            action: async (_overlay, btn) => {
-                                const isCurrent = () => currentRequest() && _overlay.isConnected && state.character === character;
-                                if (!isCurrent()) return false;
-                                const description = input.value.trim();
-                                if (!description) {
-                                    input.focus();
-                                    return true;
-                                }
-                                btn.disabled = true;
-                                btn.innerText = "CHECKING MODEL...";
-                                try {
-                                    if (!await ensureQwenVLReady()) return true;
-                                    if (!isCurrent()) return false;
-                                    btn.innerText = "THINKING...";
-                                    const r = await api.fetchApi("/vnccs/character_wizard", {
-                                        method: "POST",
-                                        headers: { "Content-Type": "application/json" },
-                                        body: JSON.stringify({ description, node_id: node.id })
-                                    });
-                                    if (!isCurrent()) return false;
-                                    if (!r.ok) {
-                                        let err = null;
-                                        try { err = await r.json(); } catch (e) { err = { message: await r.text() }; }
-                                        if (!isCurrent()) return false;
-                                        showCharacterWizardError(err);
-                                        return false;
-                                    }
-                                    const data = await r.json();
-                                    if (!isCurrent()) return false;
-                                    applyCharacterWizardData(data);
-                                    return false;
-                                } catch (e) {
-                                    if (!isCurrent()) return false;
-                                    showCharacterWizardError({ message: e.toString() });
-                                    return true;
-                                } finally {
-                                    btn.disabled = false;
-                                    btn.innerText = "FILL FIELDS";
-                                }
-                            }
-                        }
-                    ]);
+                    openWizardWorkspace({
+                        node,
+                        state,
+                        els,
+                        api,
+                        applyCharacterWizardData,
+                        beginCharacterWizardRequest,
+                        saveState,
+                        ensureQwenVLReady,
+                    });
                 };
 
                 const doCreate = () => {
@@ -4146,7 +4097,7 @@ app.registerExtension({
                 const characterWizardBtn = document.createElement("button");
                 characterWizardBtn.type = "button";
                 characterWizardBtn.className = "vnccs-creator-btn vnccs-creator-btn-primary vnccs-creator-character-wizard-btn";
-                characterWizardBtn.innerText = "CHARACTER WIZZARD";
+                characterWizardBtn.innerText = "CHARACTER WIZARD";
                 characterWizardBtn.onclick = openCharacterWizard;
                 colCenter.appendChild(characterWizardBtn);
 

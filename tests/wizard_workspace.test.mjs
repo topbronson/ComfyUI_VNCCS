@@ -1,0 +1,308 @@
+// DOM-level tests for the Character Wizard assisted drafting workspace
+// (web/vnccs_wizard_workspace.mjs). Deterministic: scripted fetchApi, no model.
+import assert from "node:assert/strict";
+import test from "node:test";
+import { registerHooks } from "node:module";
+
+// vnccs_common.js transitively imports ComfyUI's runtime scripts/api.js, which
+// only exists inside a live server (same reason sibling tests strip imports).
+// The workspace only needs injectStyles from it — styling, not behavior.
+registerHooks({
+    resolve(specifier, context, next) {
+        if (specifier.includes("vnccs_common.js")) {
+            return { url: "data:text/javascript,export function injectStyles(){}", shortCircuit: true };
+        }
+        return next(specifier, context);
+    },
+});
+
+// ── minimal DOM shim ─────────────────────────────────────────────────────────
+class FakeElement {
+    constructor(tagName) {
+        this.tagName = String(tagName).toUpperCase();
+        this.children = [];
+        this.parentNode = null;
+        this._listeners = {};
+        this._classes = new Set();
+        this.style = {};
+        this.attrs = {};
+        this.value = "";
+        this.scrollTop = 0;
+        this.scrollHeight = 0;
+        this._innerHTML = "";
+    }
+    set className(v) { this._classes = new Set(String(v).split(/\s+/).filter(Boolean)); }
+    get className() { return [...this._classes].join(" "); }
+    set innerHTML(v) { if (v === "") { for (const c of this.children) c.parentNode = null; this.children = []; } this._innerHTML = v; }
+    get innerHTML() { return this._innerHTML; }
+    get classList() {
+        const set = this._classes;
+        return {
+            add: (...c) => c.forEach(x => set.add(x)),
+            remove: (...c) => c.forEach(x => set.delete(x)),
+            contains: c => set.has(c),
+            toggle: (c, force) => {
+                const on = force === undefined ? !set.has(c) : !!force;
+                if (on) set.add(c); else set.delete(c);
+                return on;
+            },
+        };
+    }
+    append(...els) { for (const el of els) { el.parentNode = this; this.children.push(el); } }
+    appendChild(el) { this.append(el); return el; }
+    remove() {
+        if (this.parentNode) {
+            const i = this.parentNode.children.indexOf(this);
+            if (i >= 0) this.parentNode.children.splice(i, 1);
+            this.parentNode = null;
+        }
+    }
+    setAttribute(name, value) { this.attrs[name] = String(value); }
+    getAttribute(name) { return this.attrs[name]; }
+    addEventListener(type, fn) { (this._listeners[type] ||= []).push(fn); }
+    removeEventListener(type, fn) {
+        this._listeners[type] = (this._listeners[type] || []).filter(f => f !== fn);
+    }
+    contains(el) { for (let n = el; n; n = n.parentNode) if (n === this) return true; return false; }
+    get isConnected() { for (let n = this; n; n = n.parentNode) if (n === fakeDocument.body) return true; return false; }
+    focus() {}
+}
+
+const fakeDocument = {
+    createElement: tag => new FakeElement(tag),
+    head: new FakeElement("head"),
+    body: (() => { const b = new FakeElement("body"); b.parentNode = null; return b; })(),
+    getElementById: id => walk(fakeDocument.body).find(el => el.id === id) || null,
+    removeEventListener() {},
+};
+Object.defineProperty(fakeDocument.body, "isConnected", { get: () => true });
+
+globalThis.document = fakeDocument;
+globalThis.window = { confirm: () => globalThis.__confirmAnswer !== false };
+globalThis.requestAnimationFrame = fn => { fn(); return 1; };
+try {
+    Object.defineProperty(globalThis, "navigator", {
+        configurable: true,
+        value: { clipboard: { writeText: async t => { globalThis.__copied = t; } } },
+    });
+} catch { /* node may lock navigator */ }
+
+function fire(el, type, extra = {}) {
+    const ev = { type, target: el, preventDefault() {}, stopPropagation() {}, ...extra };
+    for (const fn of (el._listeners[type] || []).slice()) fn(ev);
+    return ev;
+}
+function walk(root, out = []) {
+    for (const c of root.children) { out.push(c); walk(c, out); }
+    return out;
+}
+const findAll = (root, pred) => walk(root).filter(pred);
+const findText = (root, text) => findAll(root, e => e.textContent === text)[0];
+const byClass = (root, cls) => findAll(root, e => e._classes.has(cls));
+
+// ── scripted backend ─────────────────────────────────────────────────────────
+const DRAFT_AI = {
+    sex: "female", age: 21, race: "foxfolk", skin_color: "pale skin",
+    body: "slim build", face: "sharp eyes", hair: "silver_hair",
+    eyes: "amber eyes", additional_details: "hair clips", evil_extra: "no",
+};
+
+function makeApi(t) {
+    return {
+        addEventListener() {}, removeEventListener() {},
+        fetchApi: async (route, options = {}) => {
+            const call = { route, options };
+            t.requests.push(call);
+            if (route.startsWith("/vnccs/character_wizard/backend")) {
+                return { ok: true, status: 200, json: async () => ({ mode: "remote", model: "TestModel", native_fallback: true }) };
+            }
+            if (route.startsWith("/vnccs/get_tags")) {
+                return { ok: true, status: 200, json: async () => ({ tags: { race: [{ tag: "elf" }, "foxfolk"], skin_color: [{ tag: "pale skin" }] } }) };
+            }
+            if (route === "/vnccs/wizard/assist" && t.failNext) {
+                const f = t.failNext; t.failNext = null;
+                return { ok: false, status: f.status || 429, json: async () => f.body };
+            }
+            const body = JSON.parse(options.body || "{}");
+            const scripts = {
+                draft: () => DRAFT_AI,
+                reroll_field: () => ({ suggestions: ["bob cut", "twin tails"] }),
+                polish_field: () => ({ value: "long hair, braided" }),
+                edit_command: () => ({ patch: { hair: "red_hair", age: 40 }, note: "done" }),
+                names: () => ({ suggestions: ["Aria", "Brea"] }),  // already server-sanitized
+                review: () => ({ issues: [{ note: "mismatch", field: "hair", suggestion: "silver_hair" }] }),
+            };
+            return { ok: true, status: 200, json: async () => scripts[body.action]() };
+        },
+    };
+}
+
+async function mount(seed = {}) {
+    const t = { requests: [], failNext: null };
+    const info = {
+        sex: "female", age: 20, race: "human", skin_color: "", body: "slim",
+        face: "", hair: "green_hair", eyes: "blue_eyes", additional_details: "freckles",
+        breast_size: "small_breasts", ...seed,
+    };
+    const applied = [];
+    const ctx = {
+        node: { id: 5 },
+        state: { character: "QA-Vex", character_info: info, gen_settings: { generation_mode: "qi2" } },
+        els: {},
+        api: makeApi(t),
+        applyCharacterWizardData: data => applied.push(data),
+        beginCharacterWizardRequest: () => () => true,
+        saveState() {},
+        ensureQwenVLReady: async () => true,
+    };
+    const { openWizardWorkspace } = await import("../web/vnccs_wizard_workspace.mjs");
+    const handle = await openWizardWorkspace(ctx);
+    await new Promise(r => setTimeout(r, 0));
+    const panel = byClass(fakeDocument.body, "vnccs-ws-panel")[0];
+    assert.ok(panel, "workspace panel must mount");
+    return {
+        t, panel, applied, handle,
+        panes: byClass(panel, "vnccs-ws-pane"),
+        input: () => findAll(panel, e => e.tagName === "TEXTAREA" && e.maxLength === 1500)[0],
+        send: () => findText(panel, "Send"),
+        draftRow: label => byClass(panel, "vnccs-ws-row")
+            .find(r => r.children[0]?.textContent === label),
+        close: () => handle.close(),
+    };
+}
+
+const settle = () => new Promise(r => setTimeout(r, 0));
+
+test.afterEach(() => { fakeDocument.body.children.length = 0; });
+
+// ── tests ────────────────────────────────────────────────────────────────────
+
+test("mount: split view, six modes, footer, backend badge, seeded draft, node untouched", async () => {
+    const w = await mount();
+    assert.equal(byClass(w.panel, "vnccs-ws-mode").length, 6);
+    assert.ok(findText(w.panel, "Draft") && findText(w.panel, "Fix…") && findText(w.panel, "Review"));
+    assert.ok(findText(w.panel, "Reset from node") && findText(w.panel, "Cancel") && findText(w.panel, "Apply & Close"));
+    assert.equal(byClass(w.panel, "vnccs-ws-badge")[0].textContent, "AI: TestModel");
+    assert.equal(w.draftRow("Hair").children[1].value, "green_hair");
+    // sex/age labels are innerHTML statics (not parsed by the shim): address
+    // their inputs structurally as the sole children of the grid rows.
+    const grid = byClass(w.panel, "vnccs-ws-grid2")[0];
+    assert.equal(grid.children[0].children[0].value, "female", "sex select");
+    assert.equal(grid.children[1].children[0].value, 20, "age input");
+    assert.equal(w.applied.length, 0, "node must not change before Apply");
+    w.close();
+});
+
+test("draft action: adopt fills sheet only on chip click; Apply pushes to node", async () => {
+    const w = await mount();
+    w.input().value = "a timid fox shrine maiden";
+    fire(w.send(), "click");
+    await settle();
+    const call = w.t.requests.find(r => r.route === "/vnccs/wizard/assist");
+    const body = JSON.parse(call.options.body);
+    assert.equal(body.action, "draft");
+    assert.equal(body.node_id, 5);
+    assert.ok(body.request_id, "client must always send request_id for dedupe");
+    assert.equal(w.applied.length, 0, "no node write on draft result");
+    assert.equal(w.draftRow("Hair").children[1].value, "green_hair", "adopt only on click");
+    fire(findText(w.panel, "Adopt into draft sheet"), "click");
+    assert.equal(w.draftRow("Hair").children[1].value, "silver_hair");
+    assert.equal(w.draftRow("Race / species").children[1].value, "foxfolk");
+    fire(findText(w.panel, "Apply & Close"), "click");
+    assert.equal(w.applied.length, 1);
+    assert.equal(w.applied[0].hair, "silver_hair");
+    assert.equal(w.applied[0].race, "foxfolk");
+    assert.equal(w.applied[0].breast_size, "small_breasts", "10-key contract keeps local breast_size");
+    assert.ok(!("evil_extra" in w.applied[0]), "non-contract keys never reach the node");
+    assert.equal(w.panel.isConnected, false);
+});
+
+test("reroll chip sets field; Cancel asks to discard when dirty", async () => {
+    const w = await mount();
+    fire(findText(w.panel, "Reroll field"), "click");
+    const fieldSel = findAll(w.panel, e => e.tagName === "SELECT")
+        .find(e => e.children.some(c => c.value === "hair"));
+    fieldSel.value = "hair";
+    fire(w.send(), "click");
+    await settle();
+    const chip = findAll(w.panel, e => e.textContent === "bob cut")[0];
+    assert.ok(chip, "suggestions render as chips");
+    fire(chip, "click");
+    assert.equal(w.draftRow("Hair").children[1].value, "bob cut");
+    globalThis.__confirmAnswer = false;
+    fire(findText(w.panel, "Cancel"), "click");
+    assert.equal(w.panel.isConnected, true, "dirty discard needs confirmation");
+    assert.equal(w.applied.length, 0);
+    globalThis.__confirmAnswer = true;
+    fire(findText(w.panel, "Cancel"), "click");
+    assert.equal(w.panel.isConnected, false);
+});
+
+test("edit_command Apply all updates sheet; Reset restores node values", async () => {
+    const w = await mount();
+    fire(findText(w.panel, "Fix…"), "click");
+    w.input().value = "make her 40 with red hair";
+    fire(w.send(), "click");
+    await settle();
+    fire(findText(w.panel, "Apply all (2)"), "click");
+    assert.equal(w.draftRow("Hair").children[1].value, "red_hair");
+    assert.equal(w.applied.length, 0);
+    fire(findText(w.panel, "Reset from node"), "click");
+    assert.equal(w.draftRow("Hair").children[1].value, "green_hair");
+});
+
+test("names and review render sanitized chips; accept applies suggestion", async () => {
+    const w = await mount();
+    fire(findText(w.panel, "Names"), "click");
+    fire(w.send(), "click");
+    await settle();
+    const names = findAll(w.panel, e => e._classes.has("vnccs-ws-chip")).map(e => e.textContent);
+    assert.deepEqual(names.filter(n => n === "Aria" || n === "Brea").sort(), ["Aria", "Brea"]);
+    fire(findAll(w.panel, e => e.textContent === "Aria")[0], "click");
+    await settle();
+    assert.equal(globalThis.__copied, "Aria", "name chip copies via clipboard");
+    fire(findText(w.panel, "Review"), "click");
+    fire(w.send(), "click");
+    await settle();
+    const accept = findAll(w.panel, e => (e.textContent || "").startsWith("Accept:"))[0];
+    assert.ok(accept, "review suggestion chip");
+    fire(accept, "click");
+    assert.equal(w.draftRow("Hair").children[1].value, "silver_hair");
+});
+
+test("429 in-flight renders error turn without breaking the console", async () => {
+    const w = await mount();
+    w.t.failNext = { status: 429, body: { error: "IN_FLIGHT", message: "already queued" } };
+    fire(findText(w.panel, "Names"), "click");
+    fire(w.send(), "click");
+    await settle();
+    assert.ok(findAll(w.panel, e => (e.textContent || "").includes("IN_FLIGHT")).length, "429 surfaced");
+    fire(w.send(), "click"); // console still usable
+    await settle();
+    assert.ok(w.send(), "send button still present");
+});
+
+test("Escape routes through dirty-confirm and never closes silently", async () => {
+    const w = await mount();
+    w.draftRow("Eyes").children[1].value = "violet eyes";
+    fire(w.draftRow("Eyes").children[1], "input");
+    globalThis.__confirmAnswer = false;
+    fire(w.panel, "keydown", { key: "Escape", target: w.input() });
+    assert.equal(w.panel.isConnected, true);
+    globalThis.__confirmAnswer = true;
+    fire(w.panel, "keydown", { key: "Escape", target: w.input() });
+    assert.equal(w.panel.isConnected, false);
+});
+
+test("Enter in console sends; Shift+Enter does not", async () => {
+    const w = await mount();
+    fire(findText(w.panel, "Names"), "click");
+    const before = w.t.requests.filter(r => r.route === "/vnccs/wizard/assist").length;
+    // the module installs one capture keydown listener on the panel itself
+    fire(w.panel, "keydown", { key: "Enter", target: w.input(), shiftKey: false });
+    await settle();
+    assert.equal(w.t.requests.filter(r => r.route === "/vnccs/wizard/assist").length, before + 1);
+    fire(w.panel, "keydown", { key: "Enter", target: w.input(), shiftKey: true });
+    await settle();
+    assert.equal(w.t.requests.filter(r => r.route === "/vnccs/wizard/assist").length, before + 1);
+});

@@ -755,8 +755,10 @@ def _load_wizard_backend_config():
       {"enabled": true,
        "chat_url": "http://host:8888/v1/chat/completions",
        "model": "Qwen3.8-Flash-Next",
-       "api_key": "", "api_key_env": "QWEN38_API_KEY",
-       "timeout": 120, "native_fallback": true}
+       "api_key": "",
+       "timeout": 120, "native_fallback": true, "assist_timeout": 30}
+    Keys: timeout = full-wizard call; assist_timeout = per assist action
+    (draft/reroll/polish/edit_command/names/review), default 30.
     """
     try:
         with open(WIZARD_BACKEND_CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -779,8 +781,9 @@ def _wizard_via_remote(system_prompt, user_prompt, backend):
     if not chat_url or not model:
         raise ValueError("wizard backend config requires chat_url and model")
     api_key = str(backend.get("api_key", "")).strip()
-    if not api_key:
-        api_key = os.environ.get(str(backend.get("api_key_env", "")).strip(), "").strip()
+    # No os.environ fallback here on purpose: the mandatory security scanner
+    # forbids environment access, and the wizard config file is chmod 600.
+    # (The QI2 rewrite chain keeps its own api_key_env support.)
     payload = {
         "model": model,
         "messages": [
@@ -963,6 +966,53 @@ def _sanitize_assist_names(value, count):
         if len(kept) >= max(1, min(10, int(count))):
             break
     return kept
+
+
+def _clean_assist_patch(raw_patch, draft, ctx):
+    """edit_command patch filter (module-level so tests can pin it)."""
+    if not isinstance(raw_patch, dict):
+        return {}
+    cleaned = {}
+    for key in ASSIST_PATCH_KEYS:
+        if key not in raw_patch:
+            continue
+        if key == "sex":
+            cleaned["sex"] = (
+                "male" if _clean_assist_text(raw_patch[key]).lower().startswith("m") else "female"
+            )
+        elif key == "age":
+            try:
+                cleaned["age"] = max(1, min(100, int(float(raw_patch[key]))))
+            except (TypeError, ValueError):
+                continue
+        else:
+            value = _sanitize_assist_value(key, raw_patch[key], draft, ctx)
+            if value or not _clean_assist_text(raw_patch[key]):
+                cleaned[key] = value
+            # filtered-to-empty on non-empty input = unsafe suggestion, drop the key
+    return cleaned
+
+
+def _clean_assist_issues(parsed_issues, draft, ctx):
+    """review issue filter (advisory; clickable suggestions are field-sanitized)."""
+    issues = []
+    for raw_issue in (parsed_issues or [])[:8]:
+        if not isinstance(raw_issue, dict):
+            continue
+        field = raw_issue.get("field")
+        field = field if field in ASSIST_TEXT_FIELDS else None
+        note = _clean_assist_text(raw_issue.get("note", ""))[:400]
+        suggestion = ""
+        if field:
+            suggestion = _sanitize_assist_value(field, raw_issue.get("suggestion", ""), draft, ctx)
+        if note or suggestion:
+            issue = {"note": note}
+            if field:
+                issue["field"] = field
+            if suggestion:
+                issue["suggestion"] = suggestion
+            issues.append(issue)
+    return issues
 
 
 def _validate_assist_request(post):
@@ -2492,27 +2542,7 @@ if server:
                 return web.json_response({"suggestions": kept[:5]})
 
             if action == "edit_command":
-                raw_patch = parsed.get("patch")
-                if not isinstance(raw_patch, dict):
-                    raw_patch = {}
-                cleaned_patch = {}
-                for key in ASSIST_PATCH_KEYS:
-                    if key not in raw_patch:
-                        continue
-                    if key == "sex":
-                        cleaned_patch["sex"] = (
-                            "male" if _clean_assist_text(raw_patch[key]).lower().startswith("m") else "female"
-                        )
-                    elif key == "age":
-                        try:
-                            cleaned_patch["age"] = max(1, min(100, int(float(raw_patch[key]))))
-                        except (TypeError, ValueError):
-                            continue
-                    else:
-                        value = _sanitize_assist_value(key, raw_patch[key], draft, ctx)
-                        if value or not _clean_assist_text(raw_patch[key]):
-                            cleaned_patch[key] = value
-                        # filtered-to-empty on non-empty input = unsafe suggestion, drop the key
+                cleaned_patch = _clean_assist_patch(parsed.get("patch"), draft, ctx)
                 note = _clean_assist_text(parsed.get("note", ""))[:200]
                 return web.json_response({"patch": cleaned_patch, "note": note})
 
@@ -2521,24 +2551,7 @@ if server:
 
             # review: advisory only — never mutates the draft, but every
             # clickable suggestion is filtered for its field first.
-            issues = []
-            for raw_issue in (parsed.get("issues") or [])[:8]:
-                if not isinstance(raw_issue, dict):
-                    continue
-                field = raw_issue.get("field")
-                field = field if field in ASSIST_TEXT_FIELDS else None
-                note = _clean_assist_text(raw_issue.get("note", ""))[:400]
-                suggestion = ""
-                if field:
-                    suggestion = _sanitize_assist_value(field, raw_issue.get("suggestion", ""), draft, ctx)
-                if note or suggestion:
-                    issue = {"note": note}
-                    if field:
-                        issue["field"] = field
-                    if suggestion:
-                        issue["suggestion"] = suggestion
-                    issues.append(issue)
-            return web.json_response({"issues": issues})
+            return web.json_response({"issues": _clean_assist_issues(parsed.get("issues"), draft, ctx)})
         except Exception as e:
             log_event('exception', component='Creator', level='error', exc_info=True, truncate=False, message='Operation failed', error=str(e))
             return web.json_response({
@@ -2556,17 +2569,22 @@ if server:
             return web.json_response({"error": "Invalid JSON request"}, status=400)
         if not isinstance(post, dict):
             return web.json_response({"error": "Request must be an object"}, status=400)
-        in_flight_key = f"{post.get('node_id', '')}:{post.get('request_id', '')}"
-        if in_flight_key in _ASSIST_INFLIGHT:
+        # Dedupe only when the client supplied a request_id: without one, every
+        # request would share the ":''" key and false-429 unrelated callers.
+        rid = post.get("request_id")
+        in_flight_key = f"{post.get('node_id', '')}:{rid}" if rid else None
+        if in_flight_key is not None and in_flight_key in _ASSIST_INFLIGHT:
             return web.json_response({
                 "error": "IN_FLIGHT",
                 "message": "An identical assist request is already queued or running.",
             }, status=429)
-        _ASSIST_INFLIGHT.add(in_flight_key)
+        if in_flight_key is not None:
+            _ASSIST_INFLIGHT.add(in_flight_key)
         try:
             return await run_wizard_job(_wizard_assist_response, post, "assist")
         finally:
-            _ASSIST_INFLIGHT.discard(in_flight_key)
+            if in_flight_key is not None:
+                _ASSIST_INFLIGHT.discard(in_flight_key)
 
     @server.PromptServer.instance.routes.get("/vnccs/character_wizard/backend")
     @privileged_route
