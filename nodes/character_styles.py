@@ -181,6 +181,14 @@ def delete_user_style(style_id, path=None):
                     with open(temporary, "wb") as output:
                         output.write(previous)
             raise
+        try:
+            prefs = load_style_prefs()
+            if style_id in prefs["favorites"] or any(style_id in members for members in prefs["sets"].values()):
+                prefs["favorites"] = [item for item in prefs["favorites"] if item != style_id]
+                prefs["sets"] = {key: [item for item in value if item != style_id] for key, value in prefs["sets"].items()}
+                _save_style_prefs(prefs, USER_STYLE_PREFS_PATH)
+        except ValueError:
+            pass
         return True
 
 
@@ -193,3 +201,149 @@ def save_user_style_preview(style_id, image, revision):
         if revision != style["revision"]:
             raise StorageConflictError("This style changed during rendering. Generate its preview again.")
         return save_style_preview(style_id, image)
+
+
+# ------------------------------------------------------------------
+# Style preferences: favorites and named sets (global, character-independent)
+# ------------------------------------------------------------------
+USER_STYLE_PREFS_PATH = os.path.join(os.path.dirname(USER_CHARACTER_STYLES_PATH), "character_styles.prefs.json")
+_MAX_PREFS_BYTES = 262144
+_SET_NAME_LIMIT = 60
+_MAX_SETS = 50
+_MAX_SET_MEMBERS = 200
+_MAX_FAVORITES = 200
+_STYLE_ID_RE = re.compile(r"[a-z0-9_]{1,100}")
+
+
+def _valid_style_id(style_id):
+    return isinstance(style_id, str) and _STYLE_ID_RE.fullmatch(style_id) is not None
+
+
+def _clean_set_name(name):
+    if not isinstance(name, str):
+        raise ValueError("Invalid style set name")
+    name = name.strip()
+    if not name or len(name) > _SET_NAME_LIMIT or "\x00" in name:
+        raise ValueError("Invalid style set name")
+    return name
+
+
+def _validate_prefs(raw):
+    prefs = {"favorites": [], "sets": {}}
+    if not isinstance(raw, dict):
+        return prefs
+    favorites = raw.get("favorites")
+    if isinstance(favorites, list):
+        for style_id in favorites[:_MAX_FAVORITES]:
+            if _valid_style_id(style_id) and style_id not in prefs["favorites"]:
+                prefs["favorites"].append(style_id)
+    sets = raw.get("sets")
+    if isinstance(sets, dict):
+        for name, members in list(sets.items())[:_MAX_SETS]:
+            if not isinstance(name, str):
+                continue
+            try:
+                name = _clean_set_name(name)
+            except ValueError:
+                continue
+            cleaned = []
+            if isinstance(members, list):
+                for style_id in members[:_MAX_SET_MEMBERS]:
+                    if _valid_style_id(style_id) and style_id not in cleaned:
+                        cleaned.append(style_id)
+            if name not in prefs["sets"]:
+                prefs["sets"][name] = cleaned
+    return prefs
+
+
+def load_style_prefs(path=None):
+    path = path or USER_STYLE_PREFS_PATH
+    with _STYLE_LOCK:
+        if not os.path.exists(path):
+            return {"favorites": [], "sets": {}}
+        if os.path.getsize(path) > _MAX_PREFS_BYTES:
+            raise ValueError("Style preferences file is too large")
+        try:
+            with open(path, encoding="utf-8") as source:
+                raw = json.load(source)
+        except (OSError, ValueError):
+            # Preferences are non-critical; a corrupt file degrades to defaults.
+            return {"favorites": [], "sets": {}}
+        return _validate_prefs(raw)
+
+
+def _save_style_prefs(prefs, path):
+    with atomic_output_path(path) as temporary:
+        with open(temporary, "w", encoding="utf-8") as output:
+            json.dump({"version": 1, **prefs}, output, ensure_ascii=False, indent=2)
+            output.write("\n")
+
+
+def _mutate_style_prefs(mutate, path=None):
+    path = path or USER_STYLE_PREFS_PATH
+    with _STYLE_LOCK:
+        prefs = load_style_prefs(path)
+        mutate(prefs)
+        _save_style_prefs(prefs, path)
+    return prefs
+
+
+def toggle_style_favorite(style_id):
+    if not _valid_style_id(style_id):
+        raise ValueError("Invalid style ID")
+    def mutate(prefs):
+        if style_id in prefs["favorites"]:
+            prefs["favorites"].remove(style_id)
+        else:
+            if len(prefs["favorites"]) >= _MAX_FAVORITES:
+                raise ValueError(f"Up to {_MAX_FAVORITES} favorites are supported")
+            prefs["favorites"].append(style_id)
+    return _mutate_style_prefs(mutate)
+
+
+def create_style_set(name):
+    name = _clean_set_name(name)
+    def mutate(prefs):
+        if any(existing.casefold() == name.casefold() for existing in prefs["sets"]):
+            raise ValueError("A style set with that name already exists")
+        if len(prefs["sets"]) >= _MAX_SETS:
+            raise ValueError(f"Up to {_MAX_SETS} style sets are supported")
+        prefs["sets"][name] = []
+    return _mutate_style_prefs(mutate)
+
+
+def rename_style_set(name, new_name):
+    name = _clean_set_name(name)
+    new_name = _clean_set_name(new_name)
+    def mutate(prefs):
+        if name not in prefs["sets"]:
+            raise ValueError("Style set no longer exists")
+        if new_name != name and any(existing.casefold() == new_name.casefold() for existing in prefs["sets"]):
+            raise ValueError("A style set with that name already exists")
+        prefs["sets"][new_name] = prefs["sets"].pop(name)
+    return _mutate_style_prefs(mutate)
+
+
+def delete_style_set(name):
+    name = _clean_set_name(name)
+    def mutate(prefs):
+        if prefs["sets"].pop(name, None) is None:
+            raise ValueError("Style set no longer exists")
+    return _mutate_style_prefs(mutate)
+
+
+def toggle_style_set_member(name, style_id):
+    name = _clean_set_name(name)
+    if not _valid_style_id(style_id):
+        raise ValueError("Invalid style ID")
+    def mutate(prefs):
+        members = prefs["sets"].get(name)
+        if members is None:
+            raise ValueError("Style set no longer exists")
+        if style_id in members:
+            members.remove(style_id)
+        else:
+            if len(members) >= _MAX_SET_MEMBERS:
+                raise ValueError(f"A set holds up to {_MAX_SET_MEMBERS} styles")
+            members.append(style_id)
+    return _mutate_style_prefs(mutate)

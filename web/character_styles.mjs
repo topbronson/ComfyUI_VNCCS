@@ -61,11 +61,19 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
     let deleting = false;
     let confirmation = null;
     let editingSecondary = false;
+    let prefs = { favorites: [], sets: {} };
+    let setFilter = "";
+    let popover = null;
+    let popoverOutside = null;
+    let favCollapsed = false;
+    try { favCollapsed = localStorage.getItem("VNCCS_styleFavCollapsed") === "1"; } catch (error) { /* storage unavailable */ }
     const selectedInfo = () => editingSecondary ? getSecondaryInfo() : getInfo();
     let cardScale = 130;
     let progressMessage = "";
     let updateGallery = () => {};
     let refreshLibrary = () => {};
+    let statusEl = null;
+    const setStatus = text => { if (!disposed && statusEl) statusEl.textContent = text; };
     let generatePreviews = async () => false;
     const hasPrimaryStyle = () => !["", "none"].includes(String(getInfo()?.style || "").trim().toLowerCase());
     const paintPreview = (element, style) => {
@@ -142,10 +150,12 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
         }
         updateGallery = () => {};
         refreshLibrary = () => {};
+        closePopover();
         confirmation?.remove();
         confirmation = null;
         overlay?.remove();
         overlay = null;
+        statusEl = null;
         for (const [element, previous] of inertChildren) element.inert = previous;
         inertChildren = [];
         trigger.setAttribute("aria-expanded", "false");
@@ -156,15 +166,158 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
         disposed = true; close(false);
         for (const animation of [...(motion._motionAnimations || [])]) animation.cancel();
     });
+    const postPrefs = async body => {
+        const response = await fetchApi("/vnccs/style_prefs", {
+            method: "POST", headers: { "Content-Type": "application/json", "X-VNCCS-CSRF": "1" }, body: JSON.stringify(body),
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+        if (!result || !Array.isArray(result.favorites) || !result.sets) throw new Error("Invalid style preferences response");
+        prefs = { favorites: result.favorites, sets: result.sets };
+    };
+    const closePopover = () => {
+        popover?.remove();
+        popover = null;
+        if (popoverOutside) { document.removeEventListener("pointerdown", popoverOutside, true); popoverOutside = null; }
+    };
+    const openPopover = (anchor, buildItems) => {
+        closePopover();
+        if (!overlay || disposed) return;
+        const box = make("div", "vnccs-style-popover");
+        const fill = () => {
+            box.replaceChildren();
+            const items = typeof buildItems === "function" ? buildItems() : buildItems;
+            for (const item of items) {
+                if (item.divider) { box.append(make("hr", "vnccs-style-popover-divider")); continue; }
+                const button = make("button", item.danger ? "vnccs-style-popover-danger" : "", item.label);
+                if (item.title) button.title = item.title;
+                button.onclick = async () => {
+                    button.disabled = true;
+                    try { await item.onClick(); }
+                    catch (error) { setStatus(`Style sets: ${error.message}`); }
+                    finally { if (button.isConnected) button.disabled = false; }
+                };
+                box.append(button);
+            }
+        };
+        box._vnccsFill = fill;
+        fill();
+        overlay.append(box);
+        const rect = anchor.getBoundingClientRect();
+        const size = box.getBoundingClientRect();
+        box.style.top = `${Math.min(window.innerHeight - size.height - 8, rect.bottom + 6)}px`;
+        box.style.left = `${Math.max(8, Math.min(window.innerWidth - size.width - 8, rect.left))}px`;
+        popover = box;
+        popoverOutside = event => { if (popover && !popover.contains(event.target) && (anchor.isConnected ? !anchor.contains(event.target) : true)) closePopover(); };
+        document.addEventListener("pointerdown", popoverOutside, true);
+    };
+    const refreshPopover = () => { try { popover?._vnccsFill?.(); } catch (error) { closePopover(); } };
+    const askText = ({ title, submitText, initial = "", onSubmit }) => {
+        if (!showModal || confirmation?.isConnected) return;
+        const input = make("input", "vnccs-creator-input");
+        input.value = initial;
+        input.maxLength = 60;
+        const errorText = make("p", "vnccs-style-status");
+        const body = make("div", "");
+        body.append(input, errorText);
+        const dialog = showModal(overlay, title, () => body, [
+            { text: "Cancel" },
+            { text: submitText, action: async () => {
+                try { await onSubmit(input.value); return false; }
+                catch (error) { errorText.textContent = error.message; return true; }
+            } },
+        ]);
+        confirmation = dialog.overlay;
+        input.focus();
+        input.select();
+    };
+    const refreshPrefs = async () => {
+        const currentOverlay = overlay;
+        const response = await fetchApi("/vnccs/style_prefs");
+        const result = await response.json().catch(() => null);
+        if (disposed || !overlay || overlay !== currentOverlay || !response.ok) return;
+        if (result && Array.isArray(result.favorites) && result.sets) prefs = { favorites: result.favorites, sets: result.sets };
+    };
+    const toggleFavorite = async styleId => {
+        if (batch || deleting) return;
+        await postPrefs({ action: "toggle_favorite", style_id: styleId });
+        refreshLibrary();
+        setStatus(prefs.favorites.includes(styleId) ? "Added to favorites" : "Removed from favorites");
+    };
+    const runStyleSet = async name => {
+        if (batch) { await generatePreviews(); return; }
+        const members = prefs.sets[name];
+        if (!Array.isArray(members) || !members.length) { setStatus(`Set “${name}” has no styles yet — add some from a card’s Sets button.`); return; }
+        const styles = allStyles().filter(style => members.includes(style.id) && style.id !== "none" && style.id !== "custom");
+        if (!styles.length) { setStatus(`Set “${name}” holds no styles from this model catalog.`); return; }
+        const payload = JSON.parse(JSON.stringify(getPreviewPayload()));
+        payload.gen_settings = { ...payload.gen_settings, seed: 0, seed_mode: "fixed", mode_settings: {} };
+        await generatePreviews(styles, payload);
+    };
+    const promptNewSet = () => askText({
+        title: "New style set", submitText: "Create",
+        onSubmit: async value => { await postPrefs({ action: "create_set", name: value.trim() }); refreshLibrary(); refreshPopover(); },
+    });
+    const openSetsMenu = anchor => openPopover(anchor, buildSetsMenuItems);
+    const buildSetsMenuItems = () => {
+        const names = Object.keys(prefs.sets);
+        const items = [];
+        if (!names.length) items.push({ label: "No sets yet — create one below", onClick: async () => {}, title: "" });
+        for (const name of names) {
+            const count = (prefs.sets[name] || []).length;
+            items.push({
+                label: `${setFilter === name ? "◉" : "○"} ${name} (${count})`,
+                title: "Filter the library to this set (click again to clear)",
+                onClick: async () => { setFilter = setFilter === name ? "" : name; refreshLibrary(); refreshPopover(); },
+            });
+            items.push({ label: `▶ Generate previews: ${name} (${count})`, title: "Queue every style in this set with the current Creator settings, like pressing Generate preview for each.", onClick: () => runStyleSet(name) });
+            items.push({ label: `Rename ${name}…`, onClick: () => askText({
+                title: `Rename set “${name}”`, submitText: "Rename", initial: name,
+                onSubmit: async value => {
+                    const next = value.trim();
+                    if (!next || next === name) return;
+                    await postPrefs({ action: "rename_set", name, new_name: next });
+                    if (setFilter === name) setFilter = next;
+                    refreshLibrary(); refreshPopover();
+                },
+            }) });
+            items.push({ label: `Delete ${name}`, danger: true, onClick: () => askText({
+                title: `Delete set “${name}”?`, submitText: "Delete",
+                onSubmit: async () => {
+                    await postPrefs({ action: "delete_set", name });
+                    if (setFilter === name) setFilter = "";
+                    refreshLibrary(); refreshPopover();
+                },
+            }) });
+        }
+        items.push({ divider: true });
+        items.push({ label: "+ New set…", onClick: () => promptNewSet() });
+        return items;
+    };
+    const openTileSetsMenu = (anchor, style) => openPopover(anchor, () => buildTileSetsMenuItems(style));
+    const buildTileSetsMenuItems = style => {
+        const items = [];
+        const entries = Object.entries(prefs.sets).map(([name, members]) => ({
+            label: `${members.includes(style.id) ? "✓" : "○"} ${name} (${members.length})`,
+            title: "Add or remove this style from the set",
+            onClick: async () => { await postPrefs({ action: "toggle_member", name, style_id: style.id }); refreshLibrary(); refreshPopover(); },
+        }));
+        if (entries.length) items.push(...entries, { divider: true });
+        else items.push({ label: "No sets yet", onClick: async () => {} });
+        items.push({ label: "+ New set…", onClick: () => promptNewSet() });
+        return items;
+    };
     const open = async (secondary = false) => {
         if (overlay || disposed || (secondary && (!getSecondaryInfo || !allowSecondary() || !hasPrimaryStyle()))) return;
         editingSecondary = secondary;
+        setFilter = "";
         if (!batch) progressMessage = "";
         overlay = make("section", "vnccs-style-gallery");
         overlay.setAttribute("role", "dialog");
         overlay.setAttribute("aria-modal", "true");
         overlay.setAttribute("aria-label", "Style library");
         overlay.onkeydown = event => {
+            if (popover && event.key === "Escape") { event.stopPropagation(); event.preventDefault(); closePopover(); return; }
             if (event.key === "Escape") { event.stopPropagation(); event.preventDefault(); close(); }
             if (event.key === "Tab") {
                 const controls = [...overlay.querySelectorAll("button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled)")].filter(el => !el.closest("[hidden]"));
@@ -180,6 +333,9 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
         search.setAttribute("aria-label", "Search styles");
         const filter = make("select", "vnccs-creator-select");
         filter.setAttribute("aria-label", "Style category");
+        const setsBtn = make("button", "vnccs-creator-btn", "Sets ▾");
+        setsBtn.title = "Style sets: create sets, add styles from each card's Sets button, then filter, rename, delete, or queue a preview run for a set.";
+        setsBtn.onclick = () => { if (batch || deleting || !editor.hidden) return; openSetsMenu(setsBtn); };
         const add = make("button", "vnccs-creator-btn", "New style");
         const generateAll = make("button", "vnccs-creator-btn", "Generate all previews");
         generateAll.title = "Render every library style sequentially using current Creator settings and resolution scale. Stop finishes the current image.";
@@ -187,7 +343,7 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
         const dismiss = make("button", "vnccs-creator-btn", "Close");
         dismiss.title = "Close the library and stop after the current preview";
         dismiss.onclick = () => close();
-        header.append(search, filter, add, generateAll, dismiss);
+        header.append(search, filter, setsBtn, add, generateAll, dismiss);
         const sizeControls = make("label", "vnccs-style-size-controls", "Card size");
         const sizeSlider = make("input", "vnccs-style-size-slider");
         sizeSlider.type = "range";
@@ -202,12 +358,24 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
         location.textContent = catalog.preview_directory ? `Preview folder: ${catalog.preview_directory}` : "";
         const status = make("div", "vnccs-style-status", "Loading styles...");
         status.setAttribute("role", "status");
+        statusEl = status;
         const content = make("div", "vnccs-style-content");
+        const favHead = make("div", "vnccs-style-fav-head");
+        const favToggle = make("button", "vnccs-style-fav-toggle");
+        favToggle.onclick = () => {
+            favCollapsed = !favCollapsed;
+            try { localStorage.setItem("VNCCS_styleFavCollapsed", favCollapsed ? "1" : "0"); } catch (error) { /* storage unavailable */ }
+            render();
+        };
+        favHead.append(favToggle);
+        const favGrid = make("div", "vnccs-style-grid vnccs-style-fav-grid");
+        favHead.hidden = favGrid.hidden = true;
         const grid = make("div", "vnccs-style-grid");
         const updateCardSize = () => {
             const value = Number(sizeSlider.value);
             cardScale = Number.isFinite(value) ? Math.max(80, Math.min(250, value)) : 130;
             grid.style.setProperty("--vnccs-style-card-size", `${140 * cardScale / 100}px`);
+            favGrid.style.setProperty("--vnccs-style-card-size", `${140 * cardScale / 100}px`);
             sizeValue.textContent = `${cardScale}%`;
             sizeSlider.setAttribute("aria-valuetext", `${cardScale}%`);
         };
@@ -215,7 +383,7 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
         updateCardSize();
         const editor = make("form", "vnccs-style-editor");
         editor.hidden = true;
-        content.append(grid, editor);
+        content.append(favHead, favGrid, grid, editor);
         overlay.append(header, sizeControls, location, status, content);
         inertChildren = [...host.children].map(element => [element, element.inert]);
         for (const [element] of inertChildren) element.inert = true;
@@ -242,13 +410,23 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
         };
         const render = () => {
             grid.replaceChildren();
+            favGrid.replaceChildren();
             previewSlots.clear();
+            if (!batch) progressMessage = "";
             const query = search.value.trim().toLowerCase();
-            const styles = [...(editingSecondary || allowNone() ? [noStyle] : []), custom, ...allStyles()].filter(style =>
+            let base = [...(editingSecondary || allowNone() ? [noStyle] : []), custom, ...allStyles()];
+            if (setFilter && prefs.sets[setFilter]) {
+                const members = new Set(prefs.sets[setFilter]);
+                base = base.filter(style => members.has(style.id));
+            }
+            const styles = base.filter(style =>
                 (!filter.value || style.group === filter.value) &&
                 [style.label, style.description, style.reference].join(" ").toLowerCase().includes(query));
-            status.textContent = styles.length ? `${styles.length} styles` : "No matching styles";
-            for (const style of styles) {
+            status.textContent = setFilter
+                ? `Set “${setFilter}”: ${styles.length} styles`
+                : (styles.length ? `${styles.length} styles` : "No matching styles");
+            const favSet = new Set(prefs.favorites);
+            const buildTile = (style, inFavorites) => {
                 const tile = make("div", "vnccs-style-tile");
                 const card = make("button", "vnccs-style-card");
                 card.setAttribute("aria-pressed", String(style.id === selectedInfo().style));
@@ -256,7 +434,7 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
                 const placeholder = make("span", "vnccs-style-placeholder", "Preview");
                 placeholder.setAttribute("aria-hidden", "true");
                 paintPreview(placeholder, style);
-                previewSlots.set(style.id, placeholder);
+                if (!inFavorites) previewSlots.set(style.id, placeholder);
                 card.append(placeholder, make("span", "vnccs-style-card-label", style.label));
                 card.onclick = () => {
                     if (style.id === "custom") {
@@ -264,6 +442,23 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
                     } else { setValue(style.id, true, editingSecondary); close(); }
                 };
                 tile.append(card);
+                if (style.id !== "none") {
+                    const starred = favSet.has(style.id);
+                    const fav = make("button", starred ? "vnccs-style-fav vnccs-style-fav--on" : "vnccs-style-fav", starred ? "★" : "☆");
+                    fav.title = starred ? "Remove from favorites" : "Add to favorites";
+                    fav.setAttribute("aria-label", `${starred ? "Unfavorite" : "Favorite"} ${style.label}`);
+                    fav.disabled = !!batch || deleting;
+                    fav.onclick = event => { event.stopPropagation(); toggleFavorite(style.id); };
+                    tile.append(fav);
+                    if (style.id !== "custom" && !editingSecondary) {
+                        const setsOpen = make("button", "vnccs-style-sets-open", "⛁");
+                        setsOpen.title = "Add this style to a set";
+                        setsOpen.setAttribute("aria-label", `Sets for ${style.label}`);
+                        setsOpen.disabled = !!batch || deleting;
+                        setsOpen.onclick = event => { event.stopPropagation(); openTileSetsMenu(setsOpen, style); };
+                        tile.append(setsOpen);
+                    }
+                }
                 if (style.user) {
                     const edit = make("button", "vnccs-style-edit", "Edit");
                     edit.setAttribute("aria-label", `Edit ${style.label}`);
@@ -303,8 +498,8 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
                                             if (getInfo().style === style.id) setValue(catalog.default_style, true);
                                             if (getSecondaryInfo?.().style === style.id) setValue("none", true, true);
                                         }
-                                        progressMessage = `Deleted: ${style.label}`;
                                         refreshLibrary();
+                                        setStatus(`Deleted: ${style.label}`);
                                         if (overlay === currentOverlay) search.focus();
                                         return false;
                                     } catch (error) {
@@ -321,8 +516,14 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
                         tile.append(remove);
                     }
                 }
-                grid.append(tile);
-            }
+                return tile;
+            };
+            const favorites = styles.filter(style => favSet.has(style.id) && style.id !== "none");
+            favHead.hidden = !favorites.length;
+            favGrid.hidden = !favorites.length || favCollapsed;
+            favToggle.textContent = `${favCollapsed ? "▸" : "▾"} ★ Favorites (${favorites.length})`;
+            for (const style of favorites) favGrid.append(buildTile(style, true));
+            for (const style of styles) grid.append(buildTile(style, false));
             updateGallery();
         };
         const updateFilters = () => {
@@ -475,6 +676,7 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
         refreshLibrary = () => { requestId++; loadingCatalog = false; updateFilters(); render(); };
         updateFilters();
         render();
+        refreshPrefs().then(() => { if (!disposed && overlay) render(); }).catch(() => {});
         const token = ++requestId;
         try {
             const response = await fetchApi(catalogURL());

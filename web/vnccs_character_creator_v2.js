@@ -299,6 +299,37 @@ ${SAKURA_THEME_CSS}
     width: 28px; height: 28px; padding: 0; font-size: 20px; line-height: 1;
 }
 .vnccs-creator-container .vnccs-style-delete:hover:not(:disabled) { color: var(--error); }
+.vnccs-creator-container .vnccs-style-fav,
+.vnccs-creator-container .vnccs-style-sets-open {
+    position: absolute; top: 8px; left: 8px; width: 26px; height: 26px; padding: 0;
+    border: 1px solid var(--accent-border); border-radius: 6px; background: var(--bg-primary);
+    color: var(--text-secondary); cursor: pointer; font-size: 13px; line-height: 1;
+}
+.vnccs-creator-container .vnccs-style-sets-open { left: 40px; font-size: 12px; }
+.vnccs-creator-container .vnccs-style-fav:hover:not(:disabled),
+.vnccs-creator-container .vnccs-style-sets-open:hover:not(:disabled) { color: var(--text-primary); border-color: var(--accent); }
+.vnccs-creator-container .vnccs-style-fav--on { color: #ffd166; border-color: rgba(255, 209, 102, 0.55); }
+.vnccs-style-fav-head { display: flex; align-items: center; margin: 2px 0 6px; }
+.vnccs-creator-container .vnccs-style-fav-toggle {
+    background: none; border: none; color: var(--text-secondary); cursor: pointer;
+    font-size: 12px; font-weight: 600; padding: 3px 6px; border-radius: 6px;
+}
+.vnccs-creator-container .vnccs-style-fav-toggle:hover { color: var(--text-primary); background: var(--bg-hover); }
+.vnccs-style-fav-grid { margin-bottom: 14px; }
+.vnccs-creator-container .vnccs-style-gallery .vnccs-style-popover {
+    position: fixed; z-index: 120; display: flex; flex-direction: column; gap: 2px;
+    min-width: 230px; max-width: 320px; max-height: 60vh; overflow-y: auto;
+    padding: 6px; border-radius: 10px; border: 1px solid var(--accent-border);
+    background: var(--bg-surface); box-shadow: 0 14px 36px rgba(0, 0, 0, 0.55);
+}
+.vnccs-creator-container .vnccs-style-popover button {
+    text-align: left; background: none; border: none; color: var(--text-primary);
+    font-size: 12px; padding: 7px 8px; border-radius: 6px; cursor: pointer;
+}
+.vnccs-creator-container .vnccs-style-popover button:hover:not(:disabled) { background: var(--bg-hover); }
+.vnccs-creator-container .vnccs-style-popover button:disabled { opacity: 0.5; cursor: wait; }
+.vnccs-creator-container .vnccs-style-popover .vnccs-style-popover-danger { color: var(--error); }
+.vnccs-style-popover-divider { border: none; border-top: 1px solid var(--accent-border); margin: 4px 2px; }
 .vnccs-creator-container .vnccs-style-editor { max-width: 720px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
 .vnccs-creator-container .vnccs-style-editor textarea { height: auto; min-height: 160px; resize: vertical; }
 .vnccs-creator-container .vnccs-style-gallery [hidden] { display: none; }

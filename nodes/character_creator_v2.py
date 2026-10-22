@@ -45,6 +45,8 @@ from .character_presets import CHARACTER_PRESETS, RACE_PRESETS, preset_key, race
 from .character_styles import (
     load_user_styles, save_user_style, delete_user_style, style_preview_path, style_preview_url,
     square_style_resolution, save_style_preview, save_user_style_preview,
+    load_style_prefs, toggle_style_favorite, create_style_set, rename_style_set,
+    delete_style_set, toggle_style_set_member,
     STYLE_PREVIEWS_DIR,
 )
 from . import vnccs_control_center as control_center
@@ -2491,6 +2493,42 @@ if server:
             return web.json_response({"error": str(error)}, status=400)
         except OSError:
             return web.json_response({"error": "Cannot delete user style; check file permissions"}, status=500)
+
+    @server.PromptServer.instance.routes.get("/vnccs/style_prefs")
+    async def get_style_prefs(request):
+        try:
+            return web.json_response(await asyncio.to_thread(load_style_prefs))
+        except ValueError as error:
+            return web.json_response({"error": str(error)}, status=500)
+
+    @server.PromptServer.instance.routes.post("/vnccs/style_prefs")
+    @privileged_route
+    async def post_style_prefs(request):
+        try:
+            body = await request.json()
+        except (ValueError, UnicodeError):
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"error": "Preferences payload must be a JSON object"}, status=400)
+        action = body.get("action")
+        try:
+            if action == "toggle_favorite":
+                prefs = await asyncio.to_thread(toggle_style_favorite, body.get("style_id"))
+            elif action == "create_set":
+                prefs = await asyncio.to_thread(create_style_set, body.get("name"))
+            elif action == "rename_set":
+                prefs = await asyncio.to_thread(rename_style_set, body.get("name"), body.get("new_name"))
+            elif action == "delete_set":
+                prefs = await asyncio.to_thread(delete_style_set, body.get("name"))
+            elif action == "toggle_member":
+                prefs = await asyncio.to_thread(toggle_style_set_member, body.get("name"), body.get("style_id"))
+            else:
+                return web.json_response({"error": "Unknown style preference action"}, status=400)
+            return web.json_response(prefs)
+        except ValueError as error:
+            return web.json_response({"error": str(error)}, status=400)
+        except OSError:
+            return web.json_response({"error": "Cannot save style preferences; check file permissions"}, status=500)
 
     @server.PromptServer.instance.routes.get("/vnccs/character_styles/preview")
     async def get_style_preview(request):
