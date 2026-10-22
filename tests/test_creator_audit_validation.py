@@ -386,3 +386,58 @@ def test_creator_cached_preview_never_serves_an_external_symlink(monkeypatch, tm
         (cache / "preview.png").symlink_to(outside / "private.png")
     response = asyncio.run(creator.get_cached_preview(SimpleNamespace(rel_url=SimpleNamespace(query={"character": "Alice"}))))
     assert response.status >= 400
+
+
+def _style_preview_request(character, style):
+    from types import SimpleNamespace
+    return SimpleNamespace(rel_url=SimpleNamespace(query={"character": character, "style": style}))
+
+
+def _stub_preview_response(creator, monkeypatch):
+    monkeypatch.setattr(creator.web, "Response", lambda status=200, **kwargs: SimpleNamespace(status=status), raising=False)
+    monkeypatch.setattr(creator.web, "FileResponse", lambda path, *a, **k: SimpleNamespace(status=200, path=str(path)), raising=False)
+
+
+def test_creator_style_cached_preview_serves_newest_variant(monkeypatch, tmp_path):
+    import asyncio
+    creator = load_creator_storage(monkeypatch)
+    monkeypatch.setattr(utils, "base_output_dir", lambda: str(tmp_path / "characters"))
+    _stub_preview_response(creator, monkeypatch)
+    cache = Path(utils.character_dir("Alice")) / "cache"
+    cache.mkdir(parents=True)
+    (cache / "preview_style_anime_20260101-000000.png").write_bytes(b"old")
+    (cache / "preview_style_anime_20260303-000000.png").write_bytes(b"new")
+    (cache / "preview_style_anime_20260202-120000_broken.png").write_bytes(b"malformed stamp must be ignored")
+    (cache / "preview_style_anime_notatimestamp.png").write_bytes(b"bad")
+    (cache / "preview_style_realism_20260404-000000.png").write_bytes(b"other style")
+    (cache / "preview.png").write_bytes(b"canonical")
+
+    response = asyncio.run(creator.get_style_cached_preview(_style_preview_request("Alice", "Anime")))
+    assert response.status == 200
+    assert response.path.endswith("preview_style_anime_20260303-000000.png")
+
+    missing = asyncio.run(creator.get_style_cached_preview(_style_preview_request("Alice", "Watercolor")))
+    assert missing.status == 404
+    blank = asyncio.run(creator.get_style_cached_preview(_style_preview_request("Alice", "   ")))
+    assert blank.status == 404
+    traversal = asyncio.run(creator.get_style_cached_preview(_style_preview_request("../evil", "Anime")))
+    assert traversal.status == 400
+
+
+def test_creator_style_cached_preview_never_serves_symlinks(monkeypatch, tmp_path):
+    import asyncio
+    creator = load_creator_storage(monkeypatch)
+    monkeypatch.setattr(utils, "base_output_dir", lambda: str(tmp_path / "characters"))
+    served = []
+    monkeypatch.setattr(creator.web, "Response", lambda status=200, **kwargs: SimpleNamespace(status=status), raising=False)
+    monkeypatch.setattr(creator.web, "FileResponse", lambda path, *a, **k: served.append(str(path)) or SimpleNamespace(status=200, path=str(path)), raising=False)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "private.png").write_bytes(b"private image")
+    cache = Path(utils.character_dir("Alice")) / "cache"
+    cache.mkdir(parents=True)
+    (cache / "preview_style_anime_20260101-000000.png").symlink_to(outside / "private.png")
+
+    response = asyncio.run(creator.get_style_cached_preview(_style_preview_request("Alice", "Anime")))
+    assert response.status == 404
+    assert served == []

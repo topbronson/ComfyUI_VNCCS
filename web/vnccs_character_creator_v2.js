@@ -2352,6 +2352,52 @@ app.registerExtension({
                     loader.src = cacheUrl;
                 };
 
+                // Style-aware preview: when the picker changes the style, show the newest
+                // style-keyed variant already generated for this character, or fall back
+                // to the blank "ungenerated" wait preview. Mirrors tryCachePreview's
+                // request-guard/state discipline; never claims a cache hit the server
+                // has not verified (validity is re-checked by cache key at run time).
+                const showStyleCachedPreview = () => {
+                    if (!state.character || !els.previewImg) return;
+                    const character = state.character;
+                    const styleLabel = String(state.character_info?.style_label || state.character_info?.style || "").trim();
+                    const currentRequest = beginPreviewRequest();
+                    const isCurrent = () => currentRequest() && state.character === character;
+                    const showBlank = () => {
+                        setPreviewLoading(false);
+                        els.previewImg.style.display = "none";
+                        els.previewImg.onerror = null;
+                        if (els._ui) els._ui.emptyPreview(els.previewImg, els.placeholder, character, "Generate a preview to bring this character to life.", els._ui._characterMode);
+                        else if (els.placeholder) { els.placeholder.innerText = "No Preview Image"; els.placeholder.style.display = "block"; }
+                        state.preview_valid = false;
+                        state.preview_source = "gen";
+                        hideSpriteNav();
+                    };
+                    clearPreviewHandlers();
+                    hideSpriteNav();
+                    if (!styleLabel || styleLabel.toLowerCase() === "none") {
+                        showBlank();
+                        return;
+                    }
+                    setPreviewLoading(true);
+                    const url = mediaURL(`/vnccs/get_style_cached_preview?character=${encodeURIComponent(character)}&style=${encodeURIComponent(styleLabel)}&t=${Date.now()}`);
+                    const loader = new Image();
+                    loader.onerror = () => {
+                        if (!isCurrent()) return;
+                        console.log("[VNCCS] No cached preview for style:", styleLabel);
+                        showBlank();
+                    };
+                    loader.onload = () => {
+                        if (!isCurrent()) return;
+                        setPreviewLoading(false);
+                        if (els._ui) els._ui.presentPreview(els.previewImg, els.placeholder, url, character);
+                        else { els.previewImg.src = url; els.previewImg.style.display = "block"; if (els.placeholder) els.placeholder.style.display = "none"; }
+                        state.preview_source = "gen";
+                        hideSpriteNav();
+                    };
+                    loader.src = url;
+                };
+
                 const spritePreviewUrl = (character, index) => {
                     const cacheBust = state.sprite_preview_cache_bust || "current";
                     return mediaURL(`/vnccs/get_character_pose_preview?character=${encodeURIComponent(character)}&index=${index}&v=${encodeURIComponent(cacheBust)}`);
@@ -2850,7 +2896,7 @@ app.registerExtension({
                         getSecondaryInfo: () => state.character_info.secondary_style ||= { style: "none" },
                         allowSecondary: () => ["anima", "illustrious"].includes(state.gen_settings.generation_mode),
                         allowNone: () => state.gen_settings.generation_mode !== "qi2",
-                        save: () => { saveCurrentPromptModeValues(); saveState(); },
+                        save: () => { saveCurrentPromptModeValues(); saveState(); showStyleCachedPreview(); },
                         fetchApi: (...args) => {
                             if (node._vnccsStateRestoreError) throw new Error(node._vnccsStateRestoreError);
                             return api.fetchApi(...args);

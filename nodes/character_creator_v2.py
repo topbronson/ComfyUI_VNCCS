@@ -2449,6 +2449,56 @@ if server:
             log_event('warning', component='Creator', level='warning', message=f'Error serving cached preview: {e}', error=str(e))
             return web.Response(status=500, text=str(e))
 
+    @server.PromptServer.instance.routes.get("/vnccs/get_style_cached_preview")
+    async def get_style_cached_preview(request):
+        """Serve the newest style-keyed preview variant for a character/style pair.
+
+        The frontend shows this when the user picks a style they have already
+        generated a preview for; a 404 means 'ungenerated' and the node falls
+        back to the blank wait preview. Naming comes from _style_keyed_preview_path
+        so the server is the single source of truth for the safe style key.
+        """
+        try:
+            character = request.rel_url.query.get("character", "")
+            style_label = request.rel_url.query.get("style", "")
+            if not character or ".." in character or "/" in character or "\\" in character:
+                return web.Response(status=400)
+            if not str(style_label or "").strip():
+                return web.Response(status=404)
+            cache_dir = safe_join_under(character_dir(character), "cache")
+            template = os.path.basename(_style_keyed_preview_path(cache_dir, style_label))
+            stem, sep, stamp = template.rpartition("_")
+            if not sep or not stamp.endswith(".png") or "_" in stamp[:-4]:
+                return web.Response(status=404)
+            prefix = f"{stem}_"
+            newest = None
+            if os.path.isdir(cache_dir):
+                for entry in os.scandir(cache_dir):
+                    if not entry.name.startswith(prefix) or not entry.name.endswith(".png"):
+                        continue
+                    variant_stamp = entry.name[len(prefix):-4]
+                    if "_" in variant_stamp or len(variant_stamp) != len(stamp) - 4:
+                        continue
+                    try:
+                        moment = time.mktime(time.strptime(variant_stamp, "%Y%m%d-%H%M%S"))
+                    except ValueError:
+                        continue
+                    # Never serve through a symlink: keep the same guarantee as
+                    # get_cached_preview for the whole cache directory.
+                    if entry.is_symlink():
+                        continue
+                    candidate = safe_join_under(cache_dir, entry.name)
+                    if os.path.dirname(os.path.realpath(candidate)) != os.path.realpath(cache_dir):
+                        continue
+                    if newest is None or (moment, entry.name) > newest[0:2]:
+                        newest = (moment, entry.name, candidate)
+            if newest is None:
+                return web.Response(status=404)
+            return web.FileResponse(newest[2])
+        except Exception as e:
+            log_event('warning', component='Creator', level='warning', message=f'Error serving style-keyed cached preview: {e}', error=str(e))
+            return web.Response(status=500, text=str(e))
+
     @server.PromptServer.instance.routes.get("/vnccs/get_character_pose_preview")
     async def get_character_pose_preview(request):
         try:

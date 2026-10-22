@@ -213,7 +213,7 @@ function creatorImageHarness() {
     });
     const text = source('vnccs_character_creator_v2');
     const previewButton = between(text, 'let previewRunning = false;', 'const beginWorkflowStatusRequest =');
-    vm.runInContext(`${guardCode}\nconst beginPreviewRequest = createRequestGuard(node);\n${previewButton}\nworkflowBusy = false;\n${between(text, 'const clearCharacterSelection =', 'const applyStoredPrefs =')}\n${between(text, 'const beginCharacterRequest =', 'const doGenerate = async')}\n${between(text, 'const doGenerate = async', '// 7. Graph Restore Hook')}\nglobalThis.preview = { showSpritePreview, tryCachePreview, clearCharacterSelection, doGenerate, loadChar };`, context);
+    vm.runInContext(`${guardCode}\nconst beginPreviewRequest = createRequestGuard(node);\n${previewButton}\nworkflowBusy = false;\n${between(text, 'const clearCharacterSelection =', 'const applyStoredPrefs =')}\n${between(text, 'const beginCharacterRequest =', 'const doGenerate = async')}\n${between(text, 'const doGenerate = async', '// 7. Graph Restore Hook')}\nglobalThis.preview = { showSpritePreview, tryCachePreview, showStyleCachedPreview, clearCharacterSelection, doGenerate, loadChar };`, context);
     return { context, state, node, els, images, saved, requests, ...context.preview };
 }
 
@@ -246,6 +246,43 @@ test('Creator defaults a fresh pose preview to the first sprite', async () => {
     await operation;
     assert.match(h.images[0].src, /get_character_pose_preview.*index=0/);
     assert.equal(h.state.sprite_preview_index, 0);
+});
+
+test('creator shows the newest cached style preview on style change and blanks ungenerated styles', async () => {
+    const h = creatorImageHarness();
+    h.state.character_info = { style: 'anime', style_label: 'Anime Style' };
+    h.showStyleCachedPreview();
+    assert.equal(h.images.length, 1);
+    assert.match(h.images[0].src, /\/vnccs\/get_style_cached_preview\?character=Alice&style=Anime%20Style/);
+    h.images[0].onload();
+    assert.match(h.els.previewImg.src, /get_style_cached_preview/);
+    assert.equal(h.els.previewImg.style.display, 'block');
+    assert.equal(h.els.placeholder.style.display, 'none');
+
+    // No style selected: blank wait preview, no request issued.
+    h.state.character_info = { style: 'none', style_label: 'None' };
+    h.showStyleCachedPreview();
+    assert.equal(h.images.length, 1, 'a None style must not request a variant');
+    assert.equal(h.els.previewImg.style.display, 'none');
+    assert.equal(h.state.preview_valid, false);
+
+    // Generated-for-another-style but missing for this one: server 404 -> blank wait preview.
+    h.state.character_info = { style: 'oil', style_label: 'Oil Painting' };
+    h.showStyleCachedPreview();
+    assert.equal(h.images.length, 2);
+    assert.match(h.images[1].src, /style=Oil%20Painting/);
+    h.images[1].onerror();
+    assert.equal(h.els.previewImg.style.display, 'none');
+    assert.equal(h.els.placeholder.style.display, 'block');
+    assert.equal(h.state.preview_valid, false);
+
+    // Superseded callbacks (character switched mid-flight) must not touch the preview.
+    h.state.character_info = { style: 'ink', style_label: 'Ink' };
+    h.showStyleCachedPreview();
+    h.state.character = 'Bob';
+    const before = h.els.previewImg.src;
+    h.images[2].onload();
+    assert.equal(h.els.previewImg.src, before, 'a stale style callback must be ignored');
 });
 
 test('creator rejects an old pose callback after current cache preview succeeds', () => {
