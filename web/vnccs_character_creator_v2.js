@@ -1088,7 +1088,7 @@ ${SAKURA_THEME_CSS}
 
 .vnccs-creator-tab-strip { display: flex; gap: 8px; align-items: stretch; margin-bottom: 6px; }
 .vnccs-creator-tab-strip .vnccs-creator-tab-row { flex: 1 1 auto; margin-bottom: 0; min-width: 0; }
-.vnccs-creator-cog { flex: 0 0 40px; min-width: 40px; padding: 8px 0; font-size: 13px; }
+.vnccs-creator-cog { flex: 0 0 40px; min-width: 40px; padding: 8px 0; font-size: 11px; line-height: 1.4; }
 .vnccs-creator-tab-row {
     position: relative;
     isolation: isolate;
@@ -4282,7 +4282,7 @@ app.registerExtension({
                 const cogBtn = document.createElement("button");
                 cogBtn.type = "button";
                 cogBtn.className = "vnccs-creator-tab vnccs-creator-cog";
-                cogBtn.textContent = "\u2699\uFE0E";
+                cogBtn.textContent = "\u2699"; // same glyph as Control Center's settings button
                 cogBtn.title = "Node API endpoints \u2014 configure the AI backends this node calls";
                 cogBtn.onclick = () => openNodeEndpointsModal();
                 tabStrip.appendChild(cogBtn);
