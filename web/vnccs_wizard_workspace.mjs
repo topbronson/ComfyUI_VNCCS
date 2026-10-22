@@ -7,6 +7,11 @@ import { injectStyles } from "./vnccs_common.js";
 const Z_INDEX = 10000;
 
 const CSS = `
+.vnccs-ws-exp{display:none;gap:8px;align-items:center;flex-wrap:wrap;padding:6px 12px;font-size:12px;border-top:1px solid var(--border, #333);}
+.vnccs-ws-exp-label{opacity:.7;}
+.vnccs-ws-exp-chip{display:inline-flex;gap:4px;align-items:center;border:1px dashed var(--border, #444);padding:2px 8px;border-radius:10px;}
+.vnccs-ws-exp-chip button{background:none;border:none;color:inherit;cursor:pointer;padding:0 2px;opacity:.7;font-size:12px;}
+.vnccs-ws-exp-toggle{display:inline-flex;gap:4px;align-items:center;opacity:.85;cursor:pointer;}
 .vnccs-ws-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: ${Z_INDEX}; }
 .vnccs-ws-panel { position: fixed; left: 50%; top: 50%; transform: translate(-50%,-50%);
   width: min(1120px, 94vw); height: min(740px, 90vh); min-width: 760px; min-height: 480px;
@@ -113,6 +118,11 @@ export async function openWizardWorkspace(ctx) {
     let draft = seedDraft(state.character_info || {});
     let dirty = false;
     let busy = false;
+    // Opt-in prompt experiments: unknown species tokens the sanitizer would
+    // otherwise drop. Asterisks are a render-time signal only — never stored.
+    const seedExperimentTags = () => (Array.isArray(state.character_info?.experiment_tags)
+        ? state.character_info.experiment_tags.map(String).slice(0, 8) : []);
+    let experimentTags = seedExperimentTags();
 
     const overlay = document.createElement("div");
     overlay.className = "vnccs-ws-overlay";
@@ -497,10 +507,39 @@ export async function openWizardWorkspace(ctx) {
                     syncFemaleOnly();
                     markDirty();
                     for (const k of ["race", "skin_color", "body", "face", "hair", "eyes", "additional_details"]) flashField(k);
-                    infoTurn("Draft adopted — review it on the left, then Apply & Close.");
+                    infoTurn("Draft adopted — review it on the right, then Apply & Close.");
                 });
                 return b;
             });
+            if (Array.isArray(data.flagged) && data.flagged.length) {
+                const kvE = document.createElement("div");
+                kvE.className = "vnccs-ws-kv";
+                kvE.textContent = "Not in curated presets — opt in to test whether the model responds:";
+                kvE.style.marginTop = "6px";
+                kvE.style.opacity = ".7";
+                t.appendChild(kvE);
+                chipRow(t, data.flagged, (tok) => {
+                    const wrap = document.createElement("span");
+                    wrap.className = "vnccs-ws-chip vnccs-ws-exp-chip";
+                    const label = document.createElement("span");
+                    label.textContent = "*" + tok + " ";
+                    const adopt = document.createElement("button");
+                    adopt.textContent = "Adopt";
+                    const ignore = document.createElement("button");
+                    ignore.textContent = "Ignore";
+                    adopt.addEventListener("click", () => {
+                        if (!experimentTags.some((x) => x.toLowerCase() === tok.toLowerCase())) experimentTags.push(tok);
+                        markDirty();
+                        renderExpRow();
+                        adopt.textContent = "\u2713";
+                        adopt.disabled = true;
+                        ignore.disabled = true;
+                    });
+                    ignore.addEventListener("click", () => { wrap.style.display = "none"; });
+                    wrap.append(label, adopt, ignore);
+                    return wrap;
+                });
+            }
             addMeta(t, meta);
             return;
         }
@@ -621,6 +660,59 @@ export async function openWizardWorkspace(ctx) {
 
     sendBtn.addEventListener("click", send);
 
+    // ---- experiment tags row -------------------------------------------------
+    const expRow = document.createElement("div");
+    expRow.className = "vnccs-ws-exp";
+    const currentMode = () => (state.gen_settings?.generation_mode || "illustrious").toLowerCase();
+    const expEnabled = () => {
+        const ms = state.gen_settings?.mode_settings?.[currentMode()];
+        return !!(ms && ms.include_experiment_tags);
+    };
+    function renderExpRow() {
+        expRow.innerHTML = ""; // safe: constant markup; content built via createElement
+        if (!experimentTags.length) { expRow.style.display = "none"; return; }
+        expRow.style.display = "flex";
+        const lbl = document.createElement("span");
+        lbl.className = "vnccs-ws-exp-label";
+        lbl.textContent = "Experiment tags:";
+        expRow.appendChild(lbl);
+        for (const tag of experimentTags.slice()) {
+            const chip = document.createElement("span");
+            chip.className = "vnccs-ws-chip vnccs-ws-exp-chip";
+            const txt = document.createElement("span");
+            txt.textContent = "*" + tag;
+            const x = document.createElement("button");
+            x.textContent = "\u00d7";
+            x.title = "Remove";
+            x.addEventListener("click", () => {
+                experimentTags = experimentTags.filter((t2) => t2 !== tag);
+                markDirty();
+                renderExpRow();
+            });
+            chip.append(txt, x);
+            expRow.appendChild(chip);
+        }
+        const toggle = document.createElement("label");
+        toggle.className = "vnccs-ws-exp-toggle";
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = expEnabled();
+        cb.title = `Per-mode opt-in (currently ${currentMode()}): qi2 weaves these into prose; illustrious/anima send them as weighted tags`;
+        cb.addEventListener("change", () => {
+            if (!state.gen_settings) return;
+            if (!state.gen_settings.mode_settings) state.gen_settings.mode_settings = {};
+            const mode = currentMode();
+            state.gen_settings.mode_settings[mode] = Object.assign(
+                {}, state.gen_settings.mode_settings[mode], { include_experiment_tags: cb.checked },
+            );
+            try { ctx.saveState?.(false); } catch (e) { /* noop */ }
+        });
+        const toggleText = document.createElement("span");
+        toggleText.textContent = " send to prompt (this mode)";
+        toggle.append(cb, toggleText);
+        expRow.appendChild(toggle);
+    }
+
     // ---- footer -------------------------------------------------------------
     const foot = document.createElement("div");
     foot.className = "vnccs-ws-foot";
@@ -634,18 +726,27 @@ export async function openWizardWorkspace(ctx) {
     applyBtn.className = "vnccs-ws-btn primary";
     applyBtn.textContent = "Apply & Close";
     foot.append(resetBtn, cancelBtn, applyBtn);
-    panel.appendChild(foot);
+    panel.append(expRow, foot);
+    renderExpRow();
 
     resetBtn.addEventListener("click", () => {
         draft = seedDraft(state.character_info || {});
+        experimentTags = seedExperimentTags();
         dirty = false;
         renderDraftSheet();
+        renderExpRow();
         infoTurn("Draft reset from node values.");
     });
     cancelBtn.addEventListener("click", () => confirmClose());
     closeBtn.addEventListener("click", () => confirmClose());
     applyBtn.addEventListener("click", () => {
         if (!isCurrent()) { close(); return; }
+        // Apply is the only bridge to node state: experiment tags cross with
+        // every other field, still sanitized server-side at prompt time.
+        try {
+            state.character_info.experiment_tags = experimentTags.slice(0, 8);
+            ctx.saveState?.(false);
+        } catch (e) { /* node-side errors are its own */ }
         // close first so the animated row fill on the node is visible
         close();
         try { ctx.applyCharacterWizardData({ ...draft }); } catch (e) { /* node-side errors are its own */ }

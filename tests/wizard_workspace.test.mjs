@@ -106,6 +106,7 @@ const DRAFT_AI = {
     body: "slim build", face: "sharp eyes", hair: "silver_hair",
     eyes: "amber eyes", additional_details: "hair clips", evil_extra: "no",
     rationale: "I drew on the fox-variant shrine maiden archetype, picked foxfolk for coherent ears, and kept pale skin because you mentioned moonlight.",
+    flagged: ["cetacean person", "void dancer"],
 };
 
 function makeApi(t) {
@@ -162,7 +163,7 @@ async function mount(seed = {}) {
     const panel = byClass(fakeDocument.body, "vnccs-ws-panel")[0];
     assert.ok(panel, "workspace panel must mount");
     return {
-        t, panel, applied, handle,
+        t, panel, applied, handle, ctx,
         panes: byClass(panel, "vnccs-ws-pane"),
         input: () => findAll(panel, e => e.tagName === "TEXTAREA" && e.maxLength === 1500)[0],
         send: () => findText(panel, "Send"),
@@ -284,6 +285,42 @@ test("draft chat: multi-turn history, rationale bubble, New chat reset", async (
     await settle();
     calls = w.t.requests.filter(r => r.route === "/vnccs/wizard/assist").map(r => JSON.parse(r.options.body));
     assert.deepEqual(calls[2].history, [], "New chat starts the designer fresh");
+});
+
+test("experiment tags: flagged chips, Adopt to list, per-mode toggle, Apply writes experiment_tags", async () => {
+    const w = await mount();
+    w.input().value = "make her a cetacean person";
+    fire(w.send(), "click");
+    await settle();
+    const label = findAll(w.panel, e => (e.textContent || "").startsWith("*cetacean person"))[0];
+    assert.ok(label, "flagged token renders as an opt-in chip");
+    const chip = label.parentNode;
+    assert.ok(chip._classes.has("vnccs-ws-exp-chip"), "chip carries the experiment class");
+    const adopt = findAll(chip, e => e.textContent === "Adopt")[0];
+    assert.ok(adopt, "chip has Adopt");
+    fire(adopt, "click");
+    const expRow = byClass(w.panel, "vnccs-ws-exp")[0];
+    assert.ok(findAll(expRow, e => e.textContent === "*cetacean person").length,
+        "adopted tag shows in the experiment row with its render-time asterisk");
+    const cb = findAll(expRow, e => e.tagName === "INPUT" && e.type === "checkbox")[0];
+    assert.ok(cb, "per-mode include checkbox exists");
+    cb.checked = true;
+    fire(cb, "change");
+    assert.equal(w.ctx.state.gen_settings.mode_settings.qi2.include_experiment_tags, true,
+        "toggle writes per-mode opt-in");
+    fire(findText(w.panel, "Apply & Close"), "click");
+    assert.deepEqual(w.ctx.state.character_info.experiment_tags, ["cetacean person"],
+        "Apply & Close is the only bridge to node state");
+    // Ignore hides just that chip
+    const w2 = await mount();
+    w2.input().value = "void dancer please";
+    fire(w2.send(), "click");
+    await settle();
+    const label2 = findAll(w2.panel, e => (e.textContent || "").startsWith("*void dancer"))[0];
+    assert.ok(label2, "second flagged token renders");
+    const ignore = findAll(label2.parentNode, e => e.textContent === "Ignore")[0];
+    fire(ignore, "click");
+    assert.equal(label2.parentNode.style.display, "none", "Ignore dismisses only that token");
 });
 
 test("names and review render sanitized chips; accept applies suggestion", async () => {

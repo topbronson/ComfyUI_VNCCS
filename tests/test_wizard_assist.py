@@ -23,6 +23,9 @@ from nodes.character_creator_v2 import (
     _clean_assist_history,
     _clean_assist_issues,
     _clean_assist_patch,
+    _clean_experiment_tags,
+    _experiment_tags_mode_enabled,
+    _race_flagged_tokens,
     _sanitize_assist_names,
     _sanitize_assist_value,
     _validate_assist_request,
@@ -99,6 +102,59 @@ def test_validate_caps_each_draft_field():
     post, err = _validate_assist_request({"action": "names", "draft": draft})
     assert err is None
     assert len(post["draft"]["additional_details"]) == 400
+
+
+# --- experiment tags (opt-in unknown-race surface) ----------------------------
+
+def test_race_flagged_surfaces_allowlist_misses_only():
+    flagged = _race_flagged_tokens("cetacean person, foxfolk, afro, black_student, cat_girl, jellyfish knight")
+    assert flagged == ["cetacean person", "jellyfish knight"], (
+        "known presets kept silently, social blocklist keeps silent-drop")
+    assert _race_flagged_tokens("human, person") == []
+    assert _race_flagged_tokens("afro, black student") == [], "blocklist never becomes an experiment"
+
+
+def test_race_flagged_strips_weighting_and_bounds():
+    flagged = _race_flagged_tokens("crystal:1.3 fox-being, *void dancer*, " + "x" * 200)
+    assert flagged[0] == "crystal fox-being" or flagged[0] == "crystal 1.3 fox-being"
+    assert "*" not in "".join(flagged), "asterisks never leave the render layer"
+    for token in flagged:
+        assert ":" not in token and len(token) <= 80
+    many = _race_flagged_tokens(", ".join(f"species {i}" for i in range(20)))
+    assert len(many) == 8, "capped at EXPERIMENT_TAG_LIMIT"
+    assert len(set(many)) == 8, "deduped"
+
+
+def test_clean_experiment_tags_contract():
+    assert _clean_experiment_tags("a, a, b") == ["a", "b"]
+    assert _clean_experiment_tags(["  jelly folk ", "bad\x00tag", "afro"]) == ["jelly folk", "badtag"], "control chars strip; blocklist filtered on read"
+    assert _clean_experiment_tags(None) == [] and _clean_experiment_tags(5) == []
+    assert _clean_experiment_tags({"nope": 1}) == []
+
+
+def test_experiment_tags_mode_enabled():
+    assert _experiment_tags_mode_enabled(None, "qi2") is False
+    assert _experiment_tags_mode_enabled({"include_experiment_tags": True}, "qi2") is True
+    gs = {"include_experiment_tags": True, "mode_settings": {"qi2": {"include_experiment_tags": False}}}
+    assert _experiment_tags_mode_enabled(gs, "qi2") is False, "per-mode override wins"
+    assert _experiment_tags_mode_enabled(gs, "Illustrious") is True, "falls back to global"
+
+
+def test_prompt_injection_per_mode():
+    from nodes.character_creator_v2 import CharacterCreatorV2, _qi2_character_fields
+    info = {"sex": "female", "age": 20, "race": "foxfolk", "hair": "silver_hair",
+            "eyes": "amber eyes", "face": "", "body": "slim build", "skin_color": "",
+            "additional_details": "freckles", "experiment_tags": ["cetacean markings", "void-touched"],
+            "image_type": "full_body", "style": "none"}
+    pos, _ = CharacterCreatorV2.construct_tag_prompt(info, "illustrious", include_experiment_tags=True)
+    assert "(cetacean markings:1.0)" in pos and "(void-touched:1.0)" in pos
+    pos_off, _ = CharacterCreatorV2.construct_tag_prompt(info, "illustrious", include_experiment_tags=False)
+    assert "cetacean" not in pos_off, "opt-out must be invisible in the prompt"
+    fields = _qi2_character_fields(info, include_experiment_tags=True)
+    assert "unusual species features: cetacean markings, void-touched" in fields["additional_details"]
+    assert "*" not in fields["additional_details"], "no marker leaks to the prompt"
+    fields_off = _qi2_character_fields(info)
+    assert "cetacean" not in fields_off["additional_details"]
 
 
 # --- _clean_assist_history / _clean_assist_draft -----------------------------

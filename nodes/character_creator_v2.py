@@ -680,14 +680,105 @@ def _infer_skin_color_from_description(description):
     return ""
 
 
+_RACE_HUMAN_TOKENS = {preset_key(t) for t in ("human", "person", "man", "woman", "boy", "girl")}
+# Social blocklist: ethnicity/role tokens misreported as species. These keep
+# dropping SILENTLY — they are never surfaced as experiment candidates.
+# Stored normalized (preset_key form) so "black student"/"black_student" and
+# other underscore/space variants all match.
+_RACE_BLOCK_TOKENS = {preset_key(t) for t in ("afro", "afro_student", "african", "african_student", "black", "black_student", "student")}
+EXPERIMENT_TAG_LIMIT = 8
+EXPERIMENT_TAG_MAX_LEN = 80
+
+
+def _race_token_blocked(token):
+    raw = str(token or "").strip().lower()
+    return raw in _RACE_HUMAN_TOKENS or raw in _RACE_BLOCK_TOKENS \
+        or preset_key(raw) in _RACE_HUMAN_TOKENS or preset_key(raw) in _RACE_BLOCK_TOKENS
+
+
+def _clean_experiment_token(item):
+    """Normalize one opt-in tag: no control chars, no weighting syntax, no
+    asterisk markers (asterisks are reserved as the UI's 'not yet curated'
+    signal and must never reach the prompt or stored state)."""
+    cleaned = re.sub(r"[*:]+", " ", _clean_assist_text(item))
+    # Strip trailing prompt-weight remnants (0–2 range, incl. decimals) but
+    # never a genuine numeric name part like "species 3".
+    cleaned = re.sub(r"\s*(?:2(?:\.0+)?|1(?:\.\d+)?|0(?:\.\d+)?)$", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned[:EXPERIMENT_TAG_MAX_LEN].strip()
+
+
+def _race_flagged_tokens(race):
+    """Species tokens the race sanitizer would drop as unknown-but-innocuous.
+
+    Allowlist misses are surfaced to the user for opt-in prompt experiments
+    (Qwen-Image 2.1 and Anima both accept natural-language / novel concepts;
+    only Illustrious truly depends on curated danbooru tags). Blocklist hits
+    keep the old silent-drop contract.
+    """
+    flagged, seen = [], set()
+    for token in _split_prompt_tokens(race):
+        if _race_token_blocked(token):
+            continue
+        raw = token.strip().lower()
+        if raw in RACE_OPTION_TAGS or preset_key(raw) in RACE_PRESETS:
+            continue
+        cleaned = _clean_experiment_token(token)
+        ck = preset_key(cleaned)
+        if not cleaned or ck in seen or cleaned.lower() in RACE_OPTION_TAGS or ck in RACE_PRESETS:
+            continue
+        seen.add(ck)
+        flagged.append(cleaned)
+        if len(flagged) >= EXPERIMENT_TAG_LIMIT:
+            break
+    return flagged
+
+
+def _clean_experiment_tags(value):
+    """Server-side cleaning of user-stored experiment_tags on read."""
+    if isinstance(value, str):
+        raw = _split_prompt_tokens(value)
+    elif isinstance(value, (list, tuple)):
+        raw = list(value)[:EXPERIMENT_TAG_LIMIT]
+    else:
+        return []
+    out, seen = [], set()
+    for item in raw:
+        cleaned = _clean_experiment_token(item)
+        ck = preset_key(cleaned)
+        if not cleaned or ck in seen or preset_key(cleaned.lower()) in _RACE_BLOCK_TOKENS or preset_key(cleaned.lower()) in _RACE_HUMAN_TOKENS:
+            continue
+        seen.add(ck)
+        out.append(cleaned)
+        if len(out) >= EXPERIMENT_TAG_LIMIT:
+            break
+    return out
+
+
+def _experiment_tags_mode_enabled(gen_settings, generation_mode):
+    """Per-mode opt-in, mirroring the mode_settings override pattern."""
+    settings = gen_settings or {}
+    mode = str(generation_mode or "").lower()
+    profile = (settings.get("mode_settings") or {}).get(mode) or {}
+    value = profile.get("include_experiment_tags", settings.get("include_experiment_tags", False))
+    return bool(value)
+
+
+def _attach_flagged_race(result, raw_parsed, where):
+    flagged = _race_flagged_tokens(raw_parsed.get("race", "")) if isinstance(raw_parsed, dict) else []
+    if flagged:
+        result["flagged"] = flagged
+        log_event("wizard_flagged_tag", component="Creator", level="info", truncate=False,
+                  message=f"{where}: surfaced unknown race tokens for opt-in: {flagged}")
+    return result
+
+
 def _normalize_wizard_race(race, description):
     tokens = _split_prompt_tokens(race)
     kept = []
     for token in tokens:
         key = token.strip().lower()
-        if key in {"human", "person", "man", "woman", "boy", "girl"}:
-            continue
-        if key in {"afro", "afro_student", "african", "african_student", "black", "black_student", "student"}:
+        if _race_token_blocked(token):
             continue
         if key in RACE_OPTION_TAGS or preset_key(key) in RACE_PRESETS:
             kept.append(token)
@@ -1313,7 +1404,10 @@ def _preview_cache_key(info, gen_settings):
     payload = {
         "character_info": {key: value for key, value in info.items() if key not in {"name", "seed"}},
         "gen_settings": settings,
-        "prompts": CharacterCreatorV2.construct_creator_prompt(info, settings["generation_mode"]),
+        "prompts": CharacterCreatorV2.construct_creator_prompt(
+            info, settings["generation_mode"],
+            include_experiment_tags=_experiment_tags_mode_enabled(settings, settings["generation_mode"]),
+        ),
         "style": _character_style_prompt(info),
         "files": _generation_file_signatures(settings),
     }
@@ -1646,7 +1740,7 @@ def _character_body_traits(info):
     return build, str(info.get("breast_size") or _join_prompt_tokens(breasts)).strip()
 
 
-def _character_prompt_fields(info, generation_mode="illustrious"):
+def _character_prompt_fields(info, generation_mode="illustrious", include_experiment_tags=False):
     framing_key = _character_framing_key(info)
     background = _effective_character_background(info.get("background_color", ""), generation_mode)
     body, breasts = _character_body_traits(info)
@@ -1667,12 +1761,18 @@ def _character_prompt_fields(info, generation_mode="illustrious"):
         "aesthetics": info.get("aesthetics", "masterpiece"),
         "lora_prompt": info.get("lora_prompt", ""),
     }
+    if include_experiment_tags:
+        tags = _clean_experiment_tags(info.get("experiment_tags"))
+        if tags:
+            log_event("experiment_tags_injected", component="Creator", level="info", truncate=False,
+                      message=f"prompt experiment tags injected ({generation_mode}): {tags}")
+            fields["race"] = _join_prompt_tokens([t for t in (fields.get("race", ""), *tags) if t])
     if fields["gender"] == "female":
         fields["breast_size"] = breasts
     return {key: str(value or "").strip() for key, value in fields.items()}
 
 
-def _qi2_character_fields(info):
+def _qi2_character_fields(info, include_experiment_tags=False):
     """Keep supplied fields intact and attach species hints for PE and encoding."""
     framing_key = _character_framing_key(info)
     background = _effective_character_background(info.get("background_color", ""), "qi2")
@@ -1692,6 +1792,15 @@ def _qi2_character_fields(info):
         "aesthetics": info.get("aesthetics", "masterpiece"),
         "lora_prompt": info.get("lora_prompt", ""),
     }
+    if include_experiment_tags:
+        tags = _clean_experiment_tags(info.get("experiment_tags"))
+        if tags:
+            log_event("experiment_tags_injected", component="Creator", level="info", truncate=False,
+                      message=f"prompt experiment tags woven into prose (qi2): {tags}")
+            # Qwen-Image ignores tag-shaped input: weave opt-in concepts into
+            # the free-text field the PE step already rewrites as sentences.
+            extra = "unusual species features: " + ", ".join(tags)
+            fields["additional_details"] = f'{fields["additional_details"]}, {extra}'.strip(", ")
     return {key: str(value or "").strip() for key, value in fields.items()}
 
 
@@ -1806,7 +1915,7 @@ def _qi2_expanded_field_prompt(generated_text, fields):
     return "\n\n".join(part for part in (composition, " ".join(phrases), literals) if part)
 
 
-def generate_qi2_prompt(clip, character_prompt, style_reference="", character_info=None):
+def generate_qi2_prompt(clip, character_prompt, style_reference="", character_info=None, include_experiment_tags=False):
     """Rewrite a style-free character body, then append the reference verbatim."""
     from .character_generator import _call_comfy_node
 
@@ -1814,7 +1923,7 @@ def generate_qi2_prompt(clip, character_prompt, style_reference="", character_in
     system_prompt = _qi2_prompt_rewriter_system_prompt()
     if style_reference:
         system_prompt = f"{system_prompt}\n\n{QI2_STYLE_REWRITE_RULES}"
-    fields = _qi2_character_fields(character_info) if character_info is not None else None
+    fields = _qi2_character_fields(character_info, include_experiment_tags=include_experiment_tags) if character_info is not None else None
     if fields is not None:
         pe_fields = {key: value for key, value in fields.items() if key not in QI2_LITERAL_FIELDS}
         request = "character_fields:\n" + json.dumps(pe_fields, ensure_ascii=False)
@@ -1867,11 +1976,11 @@ def generate_qi2_prompt(clip, character_prompt, style_reference="", character_in
     return rewritten_prompt
 
 
-def generate_creator_qi2_prompt(clip, character_prompt, style_reference="", character_info=None, enhance=True):
+def generate_creator_qi2_prompt(clip, character_prompt, style_reference="", character_info=None, enhance=True, include_experiment_tags=False):
     """Temporarily use Qwen's official text-to-image master prompt."""
     _ensure_prompt_server_progress_context()
     log_event("prompt_enhancement", component="Creator", enabled=enhance)
-    fields = _character_prompt_fields(character_info, "qi2") if character_info is not None else None
+    fields = _character_prompt_fields(character_info, "qi2", include_experiment_tags=include_experiment_tags) if character_info is not None else None
     if fields is not None:
         fields = {key: _strip_unit_prompt_weights(value) for key, value in fields.items()}
         original_prompt = _structured_character_prompt(fields, style_reference)
@@ -1949,15 +2058,18 @@ def encode_generation_conditioning(
     log_stage("encoding the character prompt")
     if str(gen_settings.get("generation_mode", "illustrious")).lower() == "qi2":
         from .character_generator import _call_comfy_node
+        exp_enabled = _experiment_tags_mode_enabled(gen_settings, "qi2")
 
         if creator_prompt:
             rewritten_prompt = generate_creator_qi2_prompt(
                 clip, positive_text, style_reference=style_reference, character_info=character_info,
                 enhance=gen_settings.get("qi2_prompt_enhancement", True) is not False,
+                include_experiment_tags=exp_enabled,
             )
         else:
             rewritten_prompt = generate_qi2_prompt(
                 clip, positive_text, style_reference=style_reference, character_info=character_info,
+                include_experiment_tags=exp_enabled,
             )
         positive, negative, _encoder_latent = _call_comfy_node(
             "TextEncodeQwenImage21",
@@ -2377,9 +2489,11 @@ if server:
                     content, model_used = _wizard_via_remote(system_prompt, user_prompt, backend)
                     log_event("wizard_remote_backend", component="Creator", model=model_used,
                               elapsed=round(time.time() - started, 1), truncate=False)
-                    parsed = _parse_character_wizard_json(content or "")
+                    raw_parsed = parse_wizard_json(content or "")
+                    parsed = normalize_character_wizard_traits(raw_parsed) if raw_parsed is not None else None
                     if parsed is not None:
                         parsed = postprocess_character_wizard_result(parsed, user_description)
+                        _attach_flagged_race(parsed, raw_parsed, "wizard_remote")
                         return web.json_response(parsed)
                     remote_error = "remote wizard returned unparseable JSON"
                 except Exception as e:
@@ -2445,7 +2559,8 @@ if server:
             log_stage("parsing_description")
             content = response["choices"][0]["message"]["content"]
             log_event("wizard_output", component="Creator", output=content, truncate=False)
-            parsed = _parse_character_wizard_json(content or "")
+            raw_parsed = parse_wizard_json(content or "")
+            parsed = normalize_character_wizard_traits(raw_parsed) if raw_parsed is not None else None
             if parsed is None:
                 return web.json_response({
                     "error": "PARSE_ERROR",
@@ -2453,6 +2568,7 @@ if server:
                     "raw": content or "",
                 }, status=500)
             parsed = postprocess_character_wizard_result(parsed, user_description)
+            _attach_flagged_race(parsed, raw_parsed, "wizard_local")
 
             return web.json_response(parsed)
         except Exception as e:
@@ -2575,6 +2691,7 @@ if server:
                 rationale = _clean_assist_text(raw_parsed.get("rationale", ""))[:1200]
                 parsed = postprocess_character_wizard_result(parsed, post["description"])
                 parsed["rationale"] = rationale
+                _attach_flagged_race(parsed, raw_parsed, "wizard_assist_draft")
                 return web.json_response(parsed)
 
             parsed = parse_wizard_json(content or "")
@@ -2602,7 +2719,11 @@ if server:
                     value = _sanitize_assist_value(field, item, draft, ctx)
                     if value and value not in kept:
                         kept.append(value)
-                return web.json_response({"suggestions": kept[:5]})
+                response = {"suggestions": kept[:5]}
+                if field == "race":
+                    raw_race = ", ".join(str(item) for item in (parsed.get("suggestions") or [])[:8])
+                    _attach_flagged_race(response, {"race": raw_race}, "wizard_assist_reroll")
+                return web.json_response(response)
 
             if action == "edit_command":
                 cleaned_patch = _clean_assist_patch(parsed.get("patch"), draft, ctx)
@@ -2686,6 +2807,7 @@ if server:
                 char_info,
                 gen_settings.get("generation_mode", "illustrious"),
                 include_style=gen_settings.get("generation_mode") != "qi2",
+                include_experiment_tags=_experiment_tags_mode_enabled(gen_settings, gen_settings.get("generation_mode")),
             )
             CharacterCreatorV2.log_generation_prompts(
                 "Preview input before enhancement",
@@ -3015,7 +3137,7 @@ class CharacterCreatorV2:
 
 
     @staticmethod
-    def construct_tag_prompt(info, generation_mode="illustrious", include_style=True):
+    def construct_tag_prompt(info, generation_mode="illustrious", include_style=True, include_experiment_tags=False):
         """Use the pre-3.2 tag format for Anima and Illustrious."""
         defaults = CREATOR_TAG_PROMPT_DEFAULTS[generation_mode]
         sex = info.get("sex", "female")
@@ -3043,13 +3165,23 @@ class CharacterCreatorV2:
                 value = normalize_hair_tags(value)
             if value:
                 positive += f", ({value}:1.0)"
+        if include_experiment_tags:
+            # Danbooru-shaped opt-in experiments for Illustrious/Anima: sent
+            # verbatim (weighted like every other field) so the user can test
+            # whether the checkpoint actually responds to the novel tag.
+            exp_tags = _clean_experiment_tags(info.get("experiment_tags"))
+            if exp_tags:
+                log_event("experiment_tags_injected", component="Creator", level="info", truncate=False,
+                          message=f"prompt experiment tags injected ({generation_mode}): {exp_tags}")
+                for tag in exp_tags:
+                    positive += f", ({tag}:1.0)"
         if info.get("lora_prompt"):
             positive += f", {info['lora_prompt']}"
         negative = dedupe_tokens(f"{info.get('negative_prompt', defaults['negative_prompt'])},{gender_negative}")
         return positive, negative
 
     @staticmethod
-    def construct_creator_prompt(info, generation_mode="illustrious", include_style=True):
+    def construct_creator_prompt(info, generation_mode="illustrious", include_style=True, include_experiment_tags=False):
         """
         Centralized logic for constructing positive/negative prompts from character info.
 
@@ -3059,8 +3191,10 @@ class CharacterCreatorV2:
         sex = info.get("sex", "female")
         generation_mode = str(generation_mode or "illustrious").lower()
         if generation_mode in CREATOR_TAG_PROMPT_DEFAULTS:
-            return CharacterCreatorV2.construct_tag_prompt(info, generation_mode, include_style)
-        fields = _character_prompt_fields(info, generation_mode)
+            return CharacterCreatorV2.construct_tag_prompt(
+                info, generation_mode, include_style, include_experiment_tags=include_experiment_tags,
+            )
+        fields = _character_prompt_fields(info, generation_mode, include_experiment_tags=include_experiment_tags)
         fields["hair"] = normalize_hair_tags(fields["hair"])
         fields = {key: _strip_unit_prompt_weights(value) for key, value in fields.items()}
         positive_prompt = _structured_character_prompt(
@@ -3139,6 +3273,7 @@ class CharacterCreatorV2:
             info,
             gen_settings.get("generation_mode", "illustrious"),
             include_style=gen_settings.get("generation_mode") != "qi2",
+            include_experiment_tags=_experiment_tags_mode_enabled(gen_settings, gen_settings.get("generation_mode")),
         )
         self.log_generation_prompts(
             "Workflow input before enhancement",
