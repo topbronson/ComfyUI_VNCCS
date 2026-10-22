@@ -835,7 +835,9 @@ export async function openWizardWorkspace(ctx) {
                         if (existing) await ctx.selectCharacterByName?.(canonical);
                         else await ctx.createCharacterByName?.(n);
                     } catch (e) {
-                        errorTurn({ message: `Could not ${existing ? "switch to" : "create"} “${existing ? canonical : n}”: ${e?.message || e}` });
+                        console.error(`[VNCCS wizard] ${existing ? "switch" : "create"} “${existing ? canonical : n}” failed`, e);
+                        const detail = [e?.message || String(e), e?.stack ? String(e.stack).split("\n").slice(0, 4).join(" ← ").replace(/\s+/g, " ") : ""].filter(Boolean).join(" | ");
+                        errorTurn({ message: `Could not ${existing ? "switch to" : "create"} “${existing ? canonical : n}”: ${detail}` });
                         return;
                     }
                     draft.name = ""; // consumed: it would only re-trigger the prompt
