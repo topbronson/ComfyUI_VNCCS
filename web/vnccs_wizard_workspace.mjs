@@ -124,8 +124,14 @@ export async function openWizardWorkspace(ctx) {
     const character = state.character;
     const currentRequest = ctx.beginCharacterWizardRequest();
     const isCurrent = () => currentRequest() && !node._vnccsStateRestoreError && state.character === character;
-    const existingCharacter = (name) => Array.from(els.charSelect?.options || [])
-        .some(o => String(o.value).toLowerCase() === String(name).toLowerCase());
+    const existingCharacter = (name) => canonicalCharacterName(name) !== null;
+    // Dropdown values are the canonical spellings; the server matches the
+    // metadata name exactly, so always route loads through the canonical value.
+    function canonicalCharacterName(name) {
+        const hit = Array.from(els.charSelect?.options || [])
+            .find(o => String(o.value).toLowerCase() === String(name).toLowerCase());
+        return hit ? String(hit.value) : null;
+    }
 
     injectStyles(CSS, "vnccs-wizard-workspace");
 
@@ -813,22 +819,23 @@ export async function openWizardWorkspace(ctx) {
         if (n && n.toLowerCase() !== current.toLowerCase()) {
             // Name routes the apply: confirm create-or-switch, never silently
             // touch a different character than the one the node has selected.
-            const existing = existingCharacter(n);
+            const canonical = canonicalCharacterName(n);
+            const existing = canonical !== null;
             const t = turn("model");
             t.textContent = existing
-                ? `“${n}” already exists. Switch to it and apply the draft fields there?`
+                ? `“${canonical}” already exists. Switch to it and apply the draft fields there?`
                 : `“${n}” is not a character yet. Create a new character “${n}” and apply the draft fields to it?`;
             chipRow(t, [true, false], (ok) => {
                 const b = document.createElement("button");
                 b.className = ok ? "vnccs-ws-chip" : "vnccs-ws-chip ghost";
-                b.textContent = ok ? (existing ? `Switch to “${n}” & apply` : `Create “${n}” & apply`) : "Cancel";
+                b.textContent = ok ? (existing ? `Switch to “${canonical}” & apply` : `Create “${n}” & apply`) : "Cancel";
                 b.addEventListener("click", async () => {
                     if (!ok) { infoTurn("Kept the current character. Edit the name field or press Apply again."); return; }
                     try {
-                        if (existing) await ctx.selectCharacterByName?.(n);
+                        if (existing) await ctx.selectCharacterByName?.(canonical);
                         else await ctx.createCharacterByName?.(n);
                     } catch (e) {
-                        errorTurn({ message: `Could not ${existing ? "switch to" : "create"} “${n}”: ${e?.message || e}` });
+                        errorTurn({ message: `Could not ${existing ? "switch to" : "create"} “${existing ? canonical : n}”: ${e?.message || e}` });
                         return;
                     }
                     draft.name = ""; // consumed: it would only re-trigger the prompt

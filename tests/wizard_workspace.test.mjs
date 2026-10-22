@@ -441,11 +441,11 @@ test("apply with existing other name: switch via ctx, not create", async () => {
     fire(w.draftRow("Character name").children[1], "input");
     fire(findText(w.panel, "Apply & Close"), "click");
     await settle();
-    const confirm = findText(w.panel, 'Switch to \u201cdiora\u201d & apply');
-    assert.ok(confirm, "switch-and-apply chip offered for existing character");
+    const confirm = findText(w.panel, 'Switch to \u201cDiora\u201d & apply');
+    assert.ok(confirm, "switch-and-apply chip offered with the canonical spelling");
     fire(confirm, "click");
     await settle();
-    assert.deepEqual(selected, ["diora"]);
+    assert.deepEqual(selected, ["Diora"], "switch uses the dropdown-canonical spelling, not the typed one");
     assert.equal(created.length, 0, "must not create when the character exists");
     assert.equal(w.applied.length, 1);
 });
