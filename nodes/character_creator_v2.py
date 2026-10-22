@@ -275,7 +275,26 @@ def _qi2_rewrite_backend():
     fafo container falls through to Ollama in milliseconds. If every
     backend fails, native_fallback decides between the (pathologically
     slow, ~0.6-1.9 tok/s on XPU) native TextGenerate and raising.
+
+    LOCAL HOT-PATCH (2026-10-22): when the node endpoint manager assigns an
+    endpoint to 'qi2_rewrite' it replaces the file chain (single backend);
+    "" forces native; no assignment keeps vnccs_qi2_rewrite.json in charge.
     """
+    res = _resolve_assigned_endpoint("qi2_rewrite")
+    if res is not None:
+        mode, ep = res
+        if mode == "native":
+            return None
+        if _endpoint_usable(ep):
+            return {
+                "backends": [{
+                    "chat_url": str(ep.get("chat_url", "")).strip(),
+                    "model": str(ep.get("model", "")).strip(),
+                    "timeout": int(ep.get("timeout", 300)),
+                }],
+                "native_fallback": bool(ep.get("native_fallback", True)),
+                "max_tokens": int(QI2_TEXT_GENERATION_DEFAULTS["max_length"]),
+            }
     cfg = _qi2_rewrite_config()
     if not cfg.get("enabled", False):
         return None
@@ -910,6 +929,114 @@ def _load_wizard_backend_config():
         import logging
         logging.warning("[VNCCS] invalid character wizard backend config: %s", e)
         return {}
+
+
+# --------------------------------------------------------------------
+# LOCAL HOT-PATCH (2026-10-22): Node endpoint manager.
+# Per-call-site routing for every OpenAI-compatible endpoint this node
+# calls, managed from the gear menu beside the generation model tabs.
+# user/default/vnccs_node_endpoints.json:
+#   {"endpoints": {"<id>": {"label","chat_url","model","api_key",
+#                            "timeout","native_fallback"}},
+#    "assignments": {"character_wizard": "<id>|\"\"" , "wizard_chat": ...,
+#                    "qi2_rewrite": ...}}
+# Assignment value semantics: "<id>" = use that endpoint; "" = force
+# native (no API); missing/null = fall back to the legacy per-feature
+# config file (vnccs_character_wizard.json / vnccs_qi2_rewrite.json),
+# which keeps working untouched when the manager is unused.
+# Re-read per request — no restart needed for any change.
+# --------------------------------------------------------------------
+_NODE_ENDPOINTS_FILE = "vnccs_node_endpoints.json"
+_NODE_ENDPOINT_FEATURES = (
+    {"id": "character_wizard", "label": "Character names & one-shot wizard", "mode": "single"},
+    {"id": "wizard_chat", "label": "Character Wizard chat (draft / reroll / polish / review)", "mode": "single"},
+    {"id": "qi2_rewrite", "label": "QI2 prompt rewrite", "mode": "chain"},
+)
+
+
+def _node_endpoints_path():
+    return os.path.join(folder_paths.get_user_directory(), "default", _NODE_ENDPOINTS_FILE)
+
+
+def _load_node_endpoints():
+    try:
+        with open(_node_endpoints_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        eps = data.get("endpoints")
+        asg = data.get("assignments")
+        return {
+            "endpoints": {str(k): dict(v) for k, v in eps.items() if isinstance(v, dict)} if isinstance(eps, dict) else {},
+            "assignments": dict(asg) if isinstance(asg, dict) else {},
+        }
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        import logging
+        logging.warning("[VNCCS] invalid node endpoints config: %s", e)
+        return {}
+
+
+def _save_node_endpoints(state):
+    path = _node_endpoints_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+    try:  # the file holds api_keys
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _endpoint_usable(ep):
+    return (isinstance(ep, dict) and str(ep.get("chat_url", "")).strip()
+            and str(ep.get("model", "")).strip())
+
+
+def _resolve_assigned_endpoint(feature):
+    """('native', None) | ('endpoint', ep) | None (=> use legacy config file)."""
+    state = _load_node_endpoints()
+    assignments = state.get("assignments") or {}
+    if feature not in assignments or assignments.get(feature) is None:
+        return None
+    value = assignments[feature]
+    if value == "":
+        return ("native", None)
+    ep = (state.get("endpoints") or {}).get(str(value))
+    if not _endpoint_usable(ep):
+        import logging
+        logging.warning("[VNCCS] node-endpoint assignment for '%s' points at unknown/incomplete endpoint '%s'; using config file", feature, value)
+        return None
+    return ("endpoint", ep)
+
+
+def _wizard_backend_for(feature):
+    """Wizard-callable backend dict honoring the manager, falling back to
+    vnccs_character_wizard.json (which stays the source of feature tunables
+    like assist_timeout/max_tokens/temperature)."""
+    res = _resolve_assigned_endpoint(feature)
+    if res is None:
+        return _load_wizard_backend_config()
+    mode, ep = res
+    if mode == "native":
+        return {"enabled": False}
+    if not isinstance(ep, dict) or not _endpoint_usable(ep):
+        return _load_wizard_backend_config()
+    cfg = dict(_load_wizard_backend_config())
+    cfg.update({
+        "enabled": True,
+        "chat_url": str(ep.get("chat_url", "")).strip(),
+        "model": str(ep.get("model", "")).strip(),
+        "api_key": str(ep.get("api_key", "")).strip(),
+    })
+    if ep.get("timeout") not in (None, ""):
+        cfg["timeout"] = ep["timeout"]
+    if ep.get("native_fallback") is not None:
+        cfg["native_fallback"] = bool(ep.get("native_fallback"))
+    return cfg
 
 
 def _wizard_via_remote(system_prompt, user_prompt, backend):
@@ -2582,7 +2709,7 @@ if server:
             tag_options = _extract_character_tag_options(CHARACTER_PRESETS)
             system_prompt, user_prompt = _build_character_wizard_prompts(user_description, tag_options)
 
-            backend = _load_wizard_backend_config()
+            backend = _wizard_backend_for("character_wizard")
             if backend.get("enabled"):
                 started = time.time()
                 try:
@@ -2702,7 +2829,7 @@ if server:
 
             content = None
             model_used = None
-            backend = _load_wizard_backend_config()
+            backend = _wizard_backend_for("wizard_chat")
             if backend.get("enabled"):
                 started = time.time()
                 try:
@@ -2876,13 +3003,162 @@ if server:
     @server.PromptServer.instance.routes.get("/vnccs/character_wizard/backend")
     @privileged_route
     async def vnccs_character_wizard_backend(request):
-        cfg = _load_wizard_backend_config()
+        cfg = _wizard_backend_for("character_wizard")
         enabled = bool(cfg.get("enabled")) and bool(str(cfg.get("chat_url", "")).strip()) and bool(str(cfg.get("model", "")).strip())
         return web.json_response({
             "mode": "remote" if enabled else "local",
             "model": str(cfg.get("model", "")) if enabled else QWEN_VL_MODEL_FILENAME,
             "native_fallback": bool(cfg.get("native_fallback", True)),
         })
+
+    def _node_endpoints_masked_payload():
+        state = _load_node_endpoints()
+        eps = {}
+        for k, v in (state.get("endpoints") or {}).items():
+            e = {kk: vv for kk, vv in v.items() if kk != "api_key"}
+            e["has_key"] = bool(str(v.get("api_key", "")).strip())
+            eps[k] = e
+        eff = {}
+        for feat in ("character_wizard", "wizard_chat"):
+            b = _wizard_backend_for(feat)
+            on = bool(b.get("enabled")) and str(b.get("chat_url", "")).strip() and str(b.get("model", "")).strip()
+            eff[feat] = {"mode": "remote" if on else "native",
+                         "model": str(b.get("model", "")) if on else "",
+                         "chat_url": str(b.get("chat_url", "")) if on else ""}
+        rb = _qi2_rewrite_backend()
+        eff["qi2_rewrite"] = {"mode": "chain" if rb else "native",
+                              "backends": [{"chat_url": x.get("chat_url"), "model": x.get("model")} for x in (rb or {}).get("backends", [])],
+                              "native_fallback": bool((rb or {}).get("native_fallback", True))}
+        return {"features": [dict(f) for f in _NODE_ENDPOINT_FEATURES],
+                "endpoints": eps,
+                "assignments": dict(state.get("assignments") or {}),
+                "effective": eff}
+
+    @server.PromptServer.instance.routes.get("/vnccs/node_endpoints")
+    @privileged_route
+    async def vnccs_node_endpoints_get(request):
+        return web.json_response(_node_endpoints_masked_payload())
+
+    @server.PromptServer.instance.routes.post("/vnccs/node_endpoints")
+    @privileged_route
+    async def vnccs_node_endpoints_post(request):
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid json"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"error": "invalid body"}, status=400)
+        state = _load_node_endpoints()
+        eps = state.setdefault("endpoints", {})
+        asg = state.setdefault("assignments", {})
+        action = str(body.get("action") or "")
+        feature_ids = {f["id"] for f in _NODE_ENDPOINT_FEATURES}
+        if action == "upsert_endpoint":
+            import re as _re
+            import urllib.parse
+            label = str(body.get("label") or "").strip()[:60]
+            chat_url = str(body.get("chat_url") or "").strip()
+            model = str(body.get("model") or "").strip()[:120]
+            if not label or not model:
+                return web.json_response({"error": "label and model are required"}, status=400)
+            try:
+                parsed = urllib.parse.urlparse(chat_url)
+                if parsed.scheme not in ("http", "https") or not parsed.netloc:
+                    raise ValueError(chat_url)
+            except Exception:
+                return web.json_response({"error": "chat_url must be a valid http(s) URL"}, status=400)
+            eid = str(body.get("id") or "").strip() or _re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-") or "endpoint"
+            ep = dict(eps.get(eid) or {})
+            ep.update({"label": label, "chat_url": chat_url, "model": model})
+            if body.get("clear_key"):
+                ep.pop("api_key", None)
+            elif isinstance(body.get("api_key"), str) and body["api_key"].strip():
+                ep["api_key"] = body["api_key"].strip()
+            ep.setdefault("api_key", "")
+            if body.get("timeout") not in (None, ""):
+                try:
+                    ep["timeout"] = max(1, min(3600, int(body["timeout"])))
+                except (TypeError, ValueError):
+                    pass
+            if "native_fallback" in body:
+                ep["native_fallback"] = bool(body["native_fallback"])
+            eps[eid] = ep
+        elif action == "delete_endpoint":
+            eid = str(body.get("id") or "")
+            eps.pop(eid, None)
+            for key, val in list(asg.items()):
+                if val == eid:
+                    asg[key] = None
+        elif action == "assign":
+            feature = str(body.get("feature") or "")
+            if feature not in feature_ids:
+                return web.json_response({"error": f"unknown feature {feature}"}, status=400)
+            val = body.get("endpoint_id")
+            if val is None:
+                asg[feature] = None
+            else:
+                val = str(val)
+                if val and not _endpoint_usable((state.get("endpoints") or {}).get(val)):
+                    return web.json_response({"error": f"unknown endpoint {val}"}, status=400)
+                asg[feature] = val
+        else:
+            return web.json_response({"error": f"unknown action {action}"}, status=400)
+        _save_node_endpoints(state)
+        return web.json_response(_node_endpoints_masked_payload())
+
+    @server.PromptServer.instance.routes.post("/vnccs/node_endpoints/test")
+    @privileged_route
+    async def vnccs_node_endpoints_test(request):
+        import asyncio
+        import time
+        import urllib.error
+        import urllib.request
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid json"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"error": "invalid body"}, status=400)
+        chat_url = str(body.get("chat_url") or "").strip()
+        model = str(body.get("model") or "").strip()
+        api_key = str(body.get("api_key") or "").strip()
+        eid = str(body.get("id") or "")
+        if eid and not chat_url:
+            saved = (_load_node_endpoints().get("endpoints") or {}).get(eid) or {}
+            chat_url = str(saved.get("chat_url", "")).strip()
+            model = model or str(saved.get("model", "")).strip()
+            api_key = api_key or str(saved.get("api_key", "")).strip()
+        if not chat_url or not model:
+            return web.json_response({"error": "chat_url and model required"}, status=400)
+
+        def _probe():
+            payload = {"model": model, "messages": [{"role": "user", "content": "Reply with the single word: ok"}],
+                       "max_tokens": 8, "temperature": 0, "stream": False}
+            headers = {"Content-Type": "application/json"}
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            rq = urllib.request.Request(chat_url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
+            started = time.time()
+            try:
+                with urllib.request.urlopen(rq, timeout=20) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                reply = ""
+                try:
+                    reply = str(((data.get("choices") or [{}])[0].get("message") or {}).get("content", ""))[:80]
+                except Exception:
+                    pass
+                return {"ok": True, "elapsed_ms": int((time.time() - started) * 1000), "reply": reply.strip()}
+            except urllib.error.HTTPError as exc:
+                detail = f"HTTP {exc.code}"
+                try:
+                    detail += ": " + exc.read().decode("utf-8", "ignore")[:180]
+                except Exception:
+                    pass
+                return {"ok": False, "elapsed_ms": int((time.time() - started) * 1000), "error": detail[:300]}
+            except Exception as exc:
+                return {"ok": False, "elapsed_ms": int((time.time() - started) * 1000), "error": str(exc)[:300]}
+
+        return web.json_response(await asyncio.to_thread(_probe))
 
     @logged_operation("Creator", "preview")
     def _generate_preview_response(data, style_preview=None):

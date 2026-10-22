@@ -1086,6 +1086,9 @@ ${SAKURA_THEME_CSS}
     font-size: 10px;
 }
 
+.vnccs-creator-tab-strip { display: flex; gap: 8px; align-items: stretch; margin-bottom: 6px; }
+.vnccs-creator-tab-strip .vnccs-creator-tab-row { flex: 1 1 auto; margin-bottom: 0; min-width: 0; }
+.vnccs-creator-cog { flex: 0 0 40px; min-width: 40px; padding: 8px 0; font-size: 13px; }
 .vnccs-creator-tab-row {
     position: relative;
     isolation: isolate;
@@ -4250,8 +4253,11 @@ app.registerExtension({
                 colRight.dataset.sakuraScroll = "generation";
                 colRight.innerHTML = '<div class="vnccs-creator-section-title">Generation</div>';
 
+                const tabStrip = document.createElement("div");
+                tabStrip.className = "vnccs-creator-tab-strip";
                 const tabRow = document.createElement("div");
                 tabRow.className = "vnccs-creator-tab-row";
+                tabStrip.appendChild(tabRow);
                 els.modeTabRow = tabRow;
                 els.modeTabs = {};
                 [
@@ -4267,7 +4273,175 @@ app.registerExtension({
                     els.modeTabs[value] = btn;
                     tabRow.appendChild(btn);
                 });
-                colRight.appendChild(tabRow);
+                colRight.appendChild(tabStrip);
+
+                // LOCAL HOT-PATCH (2026-10-22): gear beside the model tabs opens
+                // the node endpoint manager — every OpenAI-compatible endpoint
+                // this node calls (one-shot wizard, wizard chat, QI2 rewrite)
+                // can be pointed at its own API endpoint. Server: /vnccs/node_endpoints.
+                const cogBtn = document.createElement("button");
+                cogBtn.type = "button";
+                cogBtn.className = "vnccs-creator-tab vnccs-creator-cog";
+                cogBtn.textContent = "\u2699\uFE0E";
+                cogBtn.title = "Node API endpoints \u2014 configure the AI backends this node calls";
+                cogBtn.onclick = () => openNodeEndpointsModal();
+                tabStrip.appendChild(cogBtn);
+
+                function openNodeEndpointsModal() {
+                    showModal("Node API Endpoints", (modalEl) => {
+                        const wrap = document.createElement("div");
+                        wrap.style.cssText = "display:flex;flex-direction:column;gap:8px;min-width:430px;max-width:580px;font-size:12px;";
+                        let state = null;
+                        let editingId = null; // null = no form | "" = new | id = edit
+
+                        const mk = (tag, text, css) => {
+                            const e = document.createElement(tag);
+                            if (text != null) e.textContent = text;
+                            if (css) e.style.cssText = css;
+                            return e;
+                        };
+                        const hostOf = u => String(u || "").replace(/^https?:\/\//, "").split("/")[0];
+                        const post = async (payload, suffix) => {
+                            const res = await api.fetchApi("/vnccs/node_endpoints" + (suffix || ""), {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify(payload),
+                            });
+                            const j = await res.json().catch(() => ({}));
+                            if (!res.ok || j.error) throw new Error(j.error || `HTTP ${res.status}`);
+                            return j;
+                        };
+                        const reload = () => api.fetchApi("/vnccs/node_endpoints")
+                            .then(r => r.json())
+                            .then(s => { state = s; render(); });
+
+                        const render = () => {
+                            wrap.textContent = "";
+                            if (!state) return;
+                            wrap.appendChild(mk("div", "AI call sites", "font-weight:600;font-size:13px;"));
+                            for (const feat of state.features) {
+                                const row = mk("div", null, "display:flex;align-items:center;gap:8px;justify-content:space-between;");
+                                const left = mk("div", null, "flex:1;min-width:0;");
+                                left.appendChild(mk("div", feat.label, "font-weight:500;"));
+                                const eff = state.effective[feat.id] || {};
+                                const summary = feat.id === "qi2_rewrite"
+                                    ? (eff.mode === "chain"
+                                        ? eff.backends.map(b => `${b.model}@${hostOf(b.chat_url)}`).join(" \u2192 ") + (eff.native_fallback ? " \u2192 native" : " (fail)")
+                                        : "native TextGenerate")
+                                    : (eff.mode === "remote" ? `${eff.model}@${hostOf(eff.chat_url)}` : "native local model");
+                                left.appendChild(mk("div", summary, "opacity:.65;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:380px;"));
+                                const sel = document.createElement("select");
+                                sel.style.cssText = "max-width:200px;";
+                                const opts = [["__auto__", "Config file (auto)"], ["__native__", "Native (no API)"]];
+                                for (const [id, ep] of Object.entries(state.endpoints)) opts.push([id, `${ep.label} (${ep.model})`]);
+                                const current = state.assignments[feat.id];
+                                for (const [v, label] of opts) {
+                                    const o = document.createElement("option");
+                                    o.value = v; o.textContent = label;
+                                    o.selected = (v === "__auto__" && (current == null)) || (v === "__native__" && current === "") || v === current;
+                                    sel.appendChild(o);
+                                }
+                                sel.onchange = () => {
+                                    const v = sel.value;
+                                    post({ action: "assign", feature: feat.id, endpoint_id: v === "__auto__" ? null : (v === "__native__" ? "" : v) })
+                                        .then(s => { state = s; render(); })
+                                        .catch(e => showMessage(modalEl, e.message, true));
+                                };
+                                row.append(left, sel);
+                                wrap.appendChild(row);
+                            }
+                            wrap.appendChild(mk("div", "API endpoints", "font-weight:600;font-size:13px;margin-top:6px;"));
+                            const epIds = Object.keys(state.endpoints);
+                            if (!epIds.length) wrap.appendChild(mk("div", "No saved endpoints yet — the call sites above use their config files.", "opacity:.6;"));
+                            for (const id of epIds) {
+                                const ep = state.endpoints[id];
+                                const row = mk("div", null, "display:flex;align-items:center;gap:8px;");
+                                const left = mk("div", null, "flex:1;min-width:0;");
+                                left.appendChild(mk("div", `${ep.label} (${ep.model})${ep.has_key ? " \u26BF" : ""}`, "font-weight:500;"));
+                                left.appendChild(mk("div", ep.chat_url, "opacity:.65;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:380px;"));
+                                const testBadge = mk("span", "", "opacity:.8;");
+                                const testBtn = mk("button", "Test", "padding:2px 8px;");
+                                testBtn.type = "button";
+                                testBtn.onclick = () => {
+                                    testBtn.disabled = true; testBadge.textContent = "\u2026";
+                                    post({ id }, "/test")
+                                        .then(r => { testBadge.textContent = r.ok ? `\u2713 ${r.elapsed_ms}ms` : `\u2717 ${r.error}`; testBadge.style.color = r.ok ? "#7fd08a" : "#e57373"; })
+                                        .catch(e => { testBadge.textContent = `\u2717 ${e.message}`; })
+                                        .finally(() => { testBtn.disabled = false; });
+                                };
+                                const editBtn = mk("button", "Edit", "padding:2px 8px;");
+                                editBtn.type = "button";
+                                editBtn.onclick = () => { editingId = id; render(); };
+                                const delBtn = mk("button", "\u00D7", "padding:2px 8px;");
+                                delBtn.type = "button";
+                                delBtn.title = "Delete endpoint";
+                                delBtn.onclick = () => post({ action: "delete_endpoint", id }).then(s => { state = s; render(); }).catch(e => showMessage(modalEl, e.message, true));
+                                row.append(left, testBadge, testBtn, editBtn, delBtn);
+                                wrap.appendChild(row);
+                            }
+                            if (editingId === null) {
+                                const addBtn = mk("button", "+ Add endpoint", "align-self:flex-start;margin-top:4px;padding:3px 10px;");
+                                addBtn.type = "button";
+                                addBtn.onclick = () => { editingId = ""; render(); };
+                                wrap.appendChild(addBtn);
+                            } else {
+                                const ep = editingId ? (state.endpoints[editingId] || {}) : {};
+                                const form = mk("div", null, "display:flex;flex-direction:column;gap:4px;border:1px solid rgba(255,255,255,.12);border-radius:8px;padding:8px;margin-top:4px;");
+                                const fields = {};
+                                const addField = (key, label, value, type, placeholder) => {
+                                    const f = mk("div", null, "display:flex;align-items:center;gap:6px;");
+                                    f.appendChild(mk("label", label, "width:80px;opacity:.8;"));
+                                    const inp = document.createElement("input");
+                                    inp.type = type || "text";
+                                    inp.value = value ?? "";
+                                    inp.placeholder = placeholder || "";
+                                    inp.style.cssText = "flex:1;padding:2px 6px;";
+                                    f.appendChild(inp);
+                                    fields[key] = inp;
+                                    form.appendChild(f);
+                                    return inp;
+                                };
+                                addField("label", "Label", ep.label, "text", "My endpoint");
+                                addField("chat_url", "Chat URL", ep.chat_url, "text", "http://host:port/v1/chat/completions");
+                                addField("model", "Model", ep.model, "text", "model-name");
+                                addField("api_key", "API key", "", "password", ep.has_key ? "stored \u2014 leave blank to keep" : "optional");
+                                addField("timeout", "Timeout s", ep.timeout ?? 120, "number");
+                                const nbRow = mk("div", null, "display:flex;align-items:center;gap:6px;");
+                                nbRow.appendChild(mk("label", "Fallback", "width:80px;opacity:.8;"));
+                                const nb = document.createElement("input");
+                                nb.type = "checkbox"; nb.checked = ep.native_fallback !== false;
+                                nbRow.appendChild(nb);
+                                nbRow.appendChild(mk("span", "fall back to native/local model when this endpoint fails", "opacity:.6;"));
+                                form.appendChild(nbRow);
+                                const btnRow = mk("div", null, "display:flex;gap:6px;justify-content:flex-end;margin-top:2px;");
+                                const cancel = mk("button", "Cancel", "padding:2px 10px;");
+                                cancel.type = "button";
+                                cancel.onclick = () => { editingId = null; render(); };
+                                const save = mk("button", "Save endpoint", "padding:2px 10px;");
+                                save.type = "button";
+                                save.onclick = () => {
+                                    const payload = {
+                                        action: "upsert_endpoint",
+                                        label: fields.label.value.trim(),
+                                        chat_url: fields.chat_url.value.trim(),
+                                        model: fields.model.value.trim(),
+                                        timeout: parseInt(fields.timeout.value, 10) || 120,
+                                        native_fallback: nb.checked,
+                                    };
+                                    if (editingId) payload.id = editingId;
+                                    if (fields.api_key.value.trim()) payload.api_key = fields.api_key.value.trim();
+                                    post(payload).then(s => { state = s; editingId = null; render(); })
+                                        .catch(e => showMessage(modalEl, e.message, true));
+                                };
+                                btnRow.append(cancel, save);
+                                form.appendChild(btnRow);
+                                wrap.appendChild(form);
+                            }
+                        };
+                        reload().catch(e => showMessage(modalEl, `Could not load endpoints: ${e.message}`, true));
+                        return wrap;
+                    }, [{ text: "Close" }]);
+                }
 
                 const illustriousModels = document.createElement("div");
                 illustriousModels.className = "vnccs-creator-subsection";
