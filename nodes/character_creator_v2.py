@@ -696,6 +696,13 @@ def _race_token_blocked(token):
         or preset_key(raw) in _RACE_HUMAN_TOKENS or preset_key(raw) in _RACE_BLOCK_TOKENS
 
 
+def _token_has_blocked_word(token):
+    """Word-level blocklist screen: 'black skin' or 'african spirit' carry a
+    blocked word even when the full token is not itself blocklisted."""
+    words = re.split(r"[\s,]+", str(token or "").lower())
+    return any(preset_key(w) in _RACE_BLOCK_TOKENS for w in words if w)
+
+
 def _clean_experiment_token(item):
     """Normalize one opt-in tag: no control chars, no weighting syntax, no
     asterisk markers (asterisks are reserved as the UI's 'not yet curated'
@@ -718,7 +725,7 @@ def _race_flagged_tokens(race):
     """
     flagged, seen = [], set()
     for token in _split_prompt_tokens(race):
-        if _race_token_blocked(token):
+        if _race_token_blocked(token) or _token_has_blocked_word(token):
             continue
         raw = token.strip().lower()
         if raw in RACE_OPTION_TAGS or preset_key(raw) in RACE_PRESETS:
@@ -764,13 +771,51 @@ def _experiment_tags_mode_enabled(gen_settings, generation_mode):
     return bool(value)
 
 
-def _attach_flagged_race(result, raw_parsed, where):
-    flagged = _race_flagged_tokens(raw_parsed.get("race", "")) if isinstance(raw_parsed, dict) else []
+def _flag_tokens_for(field, value):
+    """Unknown-but-innocuous tokens for any allowlisted field, as
+    {field, token} entries. Free-text fields (hair/eyes/face/body/
+    additional_details) have no allowlist and therefore nothing to surface."""
+    if field == "race":
+        return [{"field": "race", "token": t} for t in _race_flagged_tokens(value)]
+    if field == "skin_color":
+        allowed = {preset_key(o) for o in SKIN_COLOR_OPTIONS}
+        probe = lambda c: preset_key(c) in allowed  # noqa: E731
+    elif field == "breast_size":
+        probe = lambda c: bool(_BREAST_SIZE_TAG_RE.match(c))  # noqa: E731
+    else:
+        return []
+    out, seen = [], set()
+    for token in _split_prompt_tokens(value):
+        if _token_has_blocked_word(token):
+            continue
+        cleaned = _clean_experiment_token(token)
+        ck = preset_key(cleaned)
+        if not cleaned or ck in seen or probe(cleaned):
+            continue
+        seen.add(ck)
+        out.append({"field": field, "token": cleaned})
+        if len(out) >= EXPERIMENT_TAG_LIMIT:
+            break
+    return out
+
+
+def _attach_flagged(result, raw_parsed, where):
+    if not isinstance(raw_parsed, dict):
+        return result
+    flagged = []
+    for field in ("race", "skin_color", "breast_size"):
+        flagged.extend(_flag_tokens_for(field, raw_parsed.get(field, "")))
+    flagged = flagged[:EXPERIMENT_TAG_LIMIT]
     if flagged:
         result["flagged"] = flagged
         log_event("wizard_flagged_tag", component="Creator", level="info", truncate=False,
-                  message=f"{where}: surfaced unknown race tokens for opt-in: {flagged}")
+                  message=f"{where}: surfaced unknown tokens for opt-in: {flagged}")
     return result
+
+
+def _attach_flagged_race(result, raw_parsed, where):
+    # Back-compat wrapper (tests, reroll single-field path).
+    return _attach_flagged(result, raw_parsed, where)
 
 
 def _normalize_wizard_race(race, description):
@@ -2720,15 +2765,18 @@ if server:
                     if value and value not in kept:
                         kept.append(value)
                 response = {"suggestions": kept[:5]}
-                if field == "race":
-                    raw_race = ", ".join(str(item) for item in (parsed.get("suggestions") or [])[:8])
-                    _attach_flagged_race(response, {"race": raw_race}, "wizard_assist_reroll")
+                if field in ("race", "skin_color", "breast_size"):
+                    raw_sugg = ", ".join(str(item) for item in (parsed.get("suggestions") or [])[:8])
+                    _attach_flagged(response, {field: raw_sugg}, "wizard_assist_reroll")
                 return web.json_response(response)
 
             if action == "edit_command":
                 cleaned_patch = _clean_assist_patch(parsed.get("patch"), draft, ctx)
                 note = _clean_assist_text(parsed.get("note", ""))[:200]
-                return web.json_response({"patch": cleaned_patch, "note": note})
+                response = {"patch": cleaned_patch, "note": note}
+                raw_patch = parsed.get("patch") if isinstance(parsed.get("patch"), dict) else {}
+                _attach_flagged(response, raw_patch, "wizard_assist_edit_command")
+                return web.json_response(response)
 
             if action == "names":
                 return web.json_response({"suggestions": _sanitize_assist_names(parsed.get("suggestions"), post["count"])})

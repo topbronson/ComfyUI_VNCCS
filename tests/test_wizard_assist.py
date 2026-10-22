@@ -25,6 +25,7 @@ from nodes.character_creator_v2 import (
     _clean_assist_patch,
     _clean_experiment_tags,
     _experiment_tags_mode_enabled,
+    _flag_tokens_for,
     _race_flagged_tokens,
     _sanitize_assist_names,
     _sanitize_assist_value,
@@ -138,6 +139,25 @@ def test_experiment_tags_mode_enabled():
     gs = {"include_experiment_tags": True, "mode_settings": {"qi2": {"include_experiment_tags": False}}}
     assert _experiment_tags_mode_enabled(gs, "qi2") is False, "per-mode override wins"
     assert _experiment_tags_mode_enabled(gs, "Illustrious") is True, "falls back to global"
+
+
+def test_race_flagged_word_level_blocklist_screen():
+    assert _race_flagged_tokens("african spirit, black flame wraith, void dancer") == []  or \
+        all("african" not in t and "black" not in t for t in _race_flagged_tokens("african spirit, black flame wraith, void dancer"))
+    assert {"field": "race", "token": "void dancer"} in _flag_tokens_for("race", "void dancer")
+
+
+def test_flag_tokens_for_skin_and_breast():
+    assert _flag_tokens_for("skin_color", "iridescent scale skin") == [{"field": "skin_color", "token": "iridescent scale skin"}]
+    assert _flag_tokens_for("skin_color", "golden tan skin") == [], "allowlisted value never flagged"
+    assert _flag_tokens_for("skin_color", "black skin, blue scales") == [
+        {"field": "skin_color", "token": "blue scales"}], "blocked-word token stays silently dropped"
+    assert _flag_tokens_for("breast_size", "modest bust, huge breasts") == [
+        {"field": "breast_size", "token": "modest bust"}]
+    assert _flag_tokens_for("hair", "anything at all") == [], "free-text fields have no allowlist to miss"
+    from nodes.character_creator_v2 import _attach_flagged
+    out = _attach_flagged({}, {"race": "Luminoth", "skin_color": "starlit skin", "breast_size": "large breasts"}, "test")
+    assert out["flagged"] == [{"field": "race", "token": "Luminoth"}, {"field": "skin_color", "token": "starlit skin"}]
 
 
 def test_prompt_injection_per_mode():

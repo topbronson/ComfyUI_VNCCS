@@ -106,7 +106,9 @@ const DRAFT_AI = {
     body: "slim build", face: "sharp eyes", hair: "silver_hair",
     eyes: "amber eyes", additional_details: "hair clips", evil_extra: "no",
     rationale: "I drew on the fox-variant shrine maiden archetype, picked foxfolk for coherent ears, and kept pale skin because you mentioned moonlight.",
-    flagged: ["cetacean person", "void dancer"],
+    flagged: [{"field": "race", "token": "cetacean person"},
+              {"field": "skin_color", "token": "iridescent scale skin"},
+              {"field": "breast_size", "token": "modest bust"}],
 };
 
 function makeApi(t) {
@@ -302,6 +304,13 @@ test("experiment tags: flagged chips, Adopt to list, per-mode toggle, Apply writ
     const expRow = byClass(w.panel, "vnccs-ws-exp")[0];
     assert.ok(findAll(expRow, e => e.textContent === "*cetacean person").length,
         "adopted tag shows in the experiment row with its render-time asterisk");
+    // Adopting a skin token fills the draft row (allowlists gate LLM output only)
+    const skinLabel = findAll(w.panel, e => (e.textContent || "").startsWith("*iridescent scale skin"))[0];
+    assert.ok(skinLabel, "skin token flagged with its target field");
+    assert.ok((skinLabel.textContent || "").includes("skin_color"), "chip names the field");
+    fire(findAll(skinLabel.parentNode, e => e.textContent === "Adopt")[0], "click");
+    assert.ok(findAll(w.panel, e => e.tagName === "INPUT" && e.value === "iridescent scale skin").length,
+        "skin adopt writes into the draft sheet field");
     const cb = findAll(expRow, e => e.tagName === "INPUT" && e.type === "checkbox")[0];
     assert.ok(cb, "per-mode include checkbox exists");
     cb.checked = true;
@@ -316,8 +325,8 @@ test("experiment tags: flagged chips, Adopt to list, per-mode toggle, Apply writ
     w2.input().value = "void dancer please";
     fire(w2.send(), "click");
     await settle();
-    const label2 = findAll(w2.panel, e => (e.textContent || "").startsWith("*void dancer"))[0];
-    assert.ok(label2, "second flagged token renders");
+    const label2 = findAll(w2.panel, e => (e.textContent || "").startsWith("*modest bust"))[0];
+    assert.ok(label2, "breast_size token flagged with its target field");
     const ignore = findAll(label2.parentNode, e => e.textContent === "Ignore")[0];
     fire(ignore, "click");
     assert.equal(label2.parentNode.style.display, "none", "Ignore dismisses only that token");

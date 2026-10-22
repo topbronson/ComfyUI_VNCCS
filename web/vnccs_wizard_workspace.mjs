@@ -518,19 +518,28 @@ export async function openWizardWorkspace(ctx) {
                 kvE.style.marginTop = "6px";
                 kvE.style.opacity = ".7";
                 t.appendChild(kvE);
-                chipRow(t, data.flagged, (tok) => {
+                chipRow(t, data.flagged, (raw) => {
+                    const it = typeof raw === "string" ? { field: "race", token: raw } : (raw || {});
+                    const tok = String(it.token || "");
+                    const fld = String(it.field || "race");
                     const wrap = document.createElement("span");
                     wrap.className = "vnccs-ws-chip vnccs-ws-exp-chip";
                     const label = document.createElement("span");
-                    label.textContent = "*" + tok + " ";
+                    label.textContent = "*" + tok + (fld === "race" ? " " : " → " + fld + " ");
                     const adopt = document.createElement("button");
                     adopt.textContent = "Adopt";
                     const ignore = document.createElement("button");
                     ignore.textContent = "Ignore";
                     adopt.addEventListener("click", () => {
-                        if (!experimentTags.some((x) => x.toLowerCase() === tok.toLowerCase())) experimentTags.push(tok);
-                        markDirty();
-                        renderExpRow();
+                        if (fld === "race") {
+                            if (!experimentTags.some((x) => x.toLowerCase() === tok.toLowerCase())) experimentTags.push(tok);
+                            markDirty();
+                            renderExpRow();
+                        } else if (fld === "skin_color" || fld === "breast_size") {
+                            // User-authored field values already reach the prompt verbatim
+                            // (allowlists gate LLM output only) — Adopt = type it in.
+                            setDraftField(fld, tok);
+                        }
                         adopt.textContent = "\u2713";
                         adopt.disabled = true;
                         ignore.disabled = true;
