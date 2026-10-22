@@ -688,6 +688,10 @@ _RACE_HUMAN_TOKENS = {preset_key(t) for t in ("human", "person", "man", "woman",
 _RACE_BLOCK_TOKENS = {preset_key(t) for t in ("afro", "afro_student", "african", "african_student", "black", "black_student", "student")}
 EXPERIMENT_TAG_LIMIT = 8
 EXPERIMENT_TAG_MAX_LEN = 80
+# SDXL-lineage encoders (illustrious/anima) chunk the positive prompt into
+# ~75-token windows; a measured tag costs ~5.5 tokens and late chunks carry
+# diminishing attention, so only the first N tags are injected there.
+EXPERIMENT_TAG_PROMPT_LIMIT_TAGGED = 4
 
 
 def _race_token_blocked(token):
@@ -3207,22 +3211,30 @@ class CharacterCreatorV2:
             positive += f", {background} background"
         body, breasts = _character_body_traits(info)
         body = ", ".join(value for value in (body, breasts if sex == "female" else "") if value)
+        # Danbooru-shaped opt-in experiments for Illustrious/Anima: sent
+        # verbatim (weighted like every other field) so the user can test
+        # whether the checkpoint responds. Injected right after race —
+        # measured: tail injection buries tags in chunk 3+ of the ~75-token
+        # CLIP windows, and each '(tag:1.0)' costs ~5.5 tokens, so tag modes
+        # cap the count (EXPERIMENT_TAG_PROMPT_LIMIT_TAGGED) and front-load.
+        exp_tags = _clean_experiment_tags(info.get("experiment_tags")) if include_experiment_tags else []
+        exp_tags = exp_tags[:EXPERIMENT_TAG_PROMPT_LIMIT_TAGGED]
+        if exp_tags:
+            log_event("experiment_tags_injected", component="Creator", level="info", truncate=False,
+                      message=f"prompt experiment tags injected ({generation_mode}): {exp_tags}")
         for key in ("race", "hair", "eyes", "face", "body", "skin_color", "additional_details"):
             value = body if key == "body" else info.get(key, "")
             if key == "hair":
                 value = normalize_hair_tags(value)
             if value:
                 positive += f", ({value}:1.0)"
-        if include_experiment_tags:
-            # Danbooru-shaped opt-in experiments for Illustrious/Anima: sent
-            # verbatim (weighted like every other field) so the user can test
-            # whether the checkpoint actually responds to the novel tag.
-            exp_tags = _clean_experiment_tags(info.get("experiment_tags"))
-            if exp_tags:
-                log_event("experiment_tags_injected", component="Creator", level="info", truncate=False,
-                          message=f"prompt experiment tags injected ({generation_mode}): {exp_tags}")
+            if key == "race" and exp_tags:
                 for tag in exp_tags:
                     positive += f", ({tag}:1.0)"
+        if exp_tags and not str(info.get("race", "")).strip():
+            # race was empty: fall back to tail placement so tags still land.
+            for tag in exp_tags:
+                positive += f", ({tag}:1.0)"
         if info.get("lora_prompt"):
             positive += f", {info['lora_prompt']}"
         negative = dedupe_tokens(f"{info.get('negative_prompt', defaults['negative_prompt'])},{gender_negative}")

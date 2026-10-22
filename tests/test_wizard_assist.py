@@ -177,6 +177,35 @@ def test_prompt_injection_per_mode():
     assert "cetacean" not in fields_off["additional_details"]
 
 
+def test_tag_mode_token_budget_cap_and_placement():
+    from nodes.character_creator_v2 import CharacterCreatorV2, EXPERIMENT_TAG_PROMPT_LIMIT_TAGGED
+    tags = [f"novel token {chr(97 + i)}" for i in range(EXPERIMENT_TAG_PROMPT_LIMIT_TAGGED + 3)]
+    info = {"sex": "female", "age": 20, "race": "foxfolk", "hair": "silver_hair",
+            "eyes": "", "face": "", "body": "", "skin_color": "",
+            "additional_details": "", "experiment_tags": tags,
+            "image_type": "full_body", "style": "none"}
+    pos, _ = CharacterCreatorV2.construct_tag_prompt(info, "illustrious", include_experiment_tags=True)
+    # SDXL-lineage modes inject only the first N tags; the rest never leak.
+    for i in range(EXPERIMENT_TAG_PROMPT_LIMIT_TAGGED):
+        assert f"({tags[i]}:1.0)" in pos
+    for i in range(EXPERIMENT_TAG_PROMPT_LIMIT_TAGGED, len(tags)):
+        assert tags[i] not in pos, "over-budget tags must not reach the prompt"
+    # Front-loaded: tags sit immediately after the race field, not in the tail.
+    race_at = pos.index("(foxfolk")
+    first_at = pos.index(f"({tags[0]}:1.0)")
+    tail_at = pos.rindex(f"({tags[EXPERIMENT_TAG_PROMPT_LIMIT_TAGGED - 1]}:1.0)")
+    assert race_at < first_at < tail_at
+    assert tail_at - first_at < 120, "injected tags must be contiguous right after race"
+    # Empty race: fallback tail placement still injects them.
+    info2 = dict(info, race="")
+    pos2, _ = CharacterCreatorV2.construct_tag_prompt(info2, "illustrious", include_experiment_tags=True)
+    assert f"({tags[0]}:1.0)" in pos2
+    # qi2 prose path keeps the full stored list (no chunk-window constraint).
+    from nodes.character_creator_v2 import _qi2_character_fields
+    qfields = _qi2_character_fields(info, include_experiment_tags=True)
+    assert all(t in qfields["additional_details"] for t in tags)
+
+
 # --- _clean_assist_history / _clean_assist_draft -----------------------------
 
 def test_clean_history_bounds_roles_and_drops_junk():
