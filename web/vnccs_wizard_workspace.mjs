@@ -272,7 +272,7 @@ export async function openWizardWorkspace(ctx) {
         if (r?.row) r.row.style.display = draft.sex === "female" ? "" : "none";
     }
 
-    function markDirty() { dirty = true; refreshModifiedMarks(); persistSoon(); }
+    function markDirty() { dirty = true; refreshModifiedMarks(); persistSoon("draft"); }
 
     function refreshModifiedMarks() {
         const seed = seedDraft(state.character_info || {});
@@ -379,7 +379,7 @@ export async function openWizardWorkspace(ctx) {
     newChatBtn.title = "Clear the assistant chat (the draft sheet stays)";
     newChatBtn.addEventListener("click", () => {
         draftConvo.length = 0;
-        persistSession();
+        persistSession("turns");
         msgs.innerHTML = ""; // Safe: constant-string child clear (no external content).
         infoTurn("New chat — the designer starts fresh; your draft sheet is unchanged.");
     });
@@ -390,21 +390,41 @@ export async function openWizardWorkspace(ctx) {
     // sheet and experiment tags are stored per character through the node's
     // scoped storage. “New chat” intentionally starts a fresh conversation;
     // “Reset from node” reloads the sheet from the node.
-    const PERSIST_TURNS_MAX = 60;
-    function persistSession() {
+    const PERSIST_TURNS_MAX = 24;
+    const PERSIST_TEXT_CAP = 800;
+    function persistSlim(turn) {
+        // Data diet: assistant bubbles persist as the kv line only (rationale
+        // prose is display context for one sitting, not worth re-serializing
+        // every burst); both roles get a hard size cap so the session stays KB.
+        let text = String(turn.text || "");
+        if (turn.role === "assistant") {
+            const i = text.indexOf("[current draft]");
+            if (i >= 0) text = text.slice(i);
+        }
+        if (text.length > PERSIST_TEXT_CAP) text = text.slice(0, PERSIST_TEXT_CAP);
+        return { role: turn.role, text };
+    }
+    function persistSession(part) {
         try {
-            ctx.saveWizardSession?.({
-                v: 1,
-                turns: draftConvo.slice(-PERSIST_TURNS_MAX),
-                draft: stripName(draft),
-                experimentTags: experimentTags.slice(0, 8),
-            });
+            const s = {};
+            if (!part || part === "turns") s.turns = draftConvo.slice(-PERSIST_TURNS_MAX).map(persistSlim);
+            if (!part || part === "draft") { s.draft = stripName(draft); s.experimentTags = experimentTags.slice(0, 8); }
+            ctx.saveWizardSession?.(s, part || "all");
         } catch (e) { /* storage is best-effort */ }
     }
     let persistTimer = null;
-    function persistSoon() {
+    let persistIdle = null;
+    function persistSoon(part) {
+        // Keystroke-rate writes are what made the dialog feel sluggish: the old
+        // 400ms timer re-stringified the whole session mid-typing. Now: longer
+        // debounce, sheet-typing only writes the ~1KB draft part, and the write
+        // itself is deferred to idle time so it never lands inside a keystroke.
         if (persistTimer) return;
-        persistTimer = setTimeout(() => { persistTimer = null; persistSession(); }, 400);
+        persistTimer = setTimeout(() => {
+            persistTimer = null;
+            const run = () => { persistIdle = null; persistSession(part); };
+            persistIdle = (globalThis.requestIdleCallback || (cb => setTimeout(cb, 0)))(run, { timeout: 1200 });
+        }, 1200);
     }
     const sessionRestored = (function restoreSession() {
         let saved = null;
@@ -511,7 +531,7 @@ export async function openWizardWorkspace(ctx) {
             payload.history = draftConvo.slice(-12);
             payload.draft = stripName(draft);
             draftConvo.push({ role: "user", text });
-            persistSession();
+            persistSession("turns");
         }
         else if (action === "reroll_field" || action === "polish_field") {
             payload.field = fieldSel.value; payload.instruction = text; payload.draft = stripName(draft);
@@ -588,7 +608,7 @@ export async function openWizardWorkspace(ctx) {
                     + "[current draft] " + ["sex", "age", "race", "skin_color", "body", "face", "hair", "eyes", "additional_details"]
                         .map(k => `${k}=${data[k] ?? ""}`).join("; "),
             });
-            persistSession();
+            persistSession("turns");
             const kv = document.createElement("div");
             kv.className = "vnccs-ws-kv";
             kv.textContent = ["sex", "age", "race", "skin_color", "body", "face", "hair", "eyes", "additional_details"]
@@ -864,7 +884,7 @@ export async function openWizardWorkspace(ctx) {
         dirty = false;
         renderDraftSheet();
         renderExpRow();
-        persistSession();
+        persistSession("draft");
         infoTurn("Draft reset from node values.");
     });
     cancelBtn.addEventListener("click", () => confirmClose());
@@ -921,7 +941,9 @@ export async function openWizardWorkspace(ctx) {
 
     // ---- keyboard, close, lifecycle ----------------------------------------
     function confirmClose() {
-        if (dirty && !window.confirm("Discard unsaved draft changes?")) return;
+        // No blocking confirm anymore: draft + chat auto-persist every burst
+        // (and close() itself flushes), so closing can never lose work. The
+        // old window.confirm froze the main thread and felt like the lag.
         close();
     }
 
@@ -929,8 +951,10 @@ export async function openWizardWorkspace(ctx) {
     function close() {
         if (closed) return;
         closed = true;
-        persistSession();
         if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
+        if (persistIdle != null && typeof cancelIdleCallback === "function") { try { cancelIdleCallback(persistIdle); } catch { /* noop */ } }
+        persistIdle = null;
+        persistSession("all"); // close always flushes synchronously — nothing can be lost
         overlay.remove();
         document.removeEventListener("keydown", onKeydown, true);
         els.charSelect?.removeEventListener?.("change", onCharSwitch);

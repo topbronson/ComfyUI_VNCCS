@@ -3844,11 +3844,23 @@ app.registerExtension({
                         saveState,
                         ensureQwenVLReady,
                         loadWizardSession: () => {
-                            try { return JSON.parse(storage.getItem(wizardSessionKey) || "null"); }
-                            catch { return null; }
+                            // Split keys: chat turns and the draft sheet persist
+                            // separately so keystroke-rate sheet writes re-serialize
+                            // ~1KB instead of the whole conversation. Legacy
+                            // single-key sessions still load (and migrate on next save).
+                            const parse = k => { try { return JSON.parse(storage.getItem(k) || "null"); } catch { return null; } };
+                            const legacy = parse(wizardSessionKey);
+                            const splitT = parse(wizardSessionKey + ":turns");
+                            const splitD = parse(wizardSessionKey + ":draft");
+                            if (!splitT && !splitD) return legacy;
+                            return { ...(legacy || {}), ...(splitD || {}), ...(splitT || {}) };
                         },
-                        saveWizardSession: (session) => {
-                            try { storage.setItem(wizardSessionKey, JSON.stringify(session)); } catch { /* best effort */ }
+                        saveWizardSession: (session, part) => {
+                            try {
+                                if (!part || part === "turns") storage.setItem(wizardSessionKey + ":turns", JSON.stringify({ v: 1, turns: session.turns || [] }));
+                                if (!part || part === "draft") storage.setItem(wizardSessionKey + ":draft", JSON.stringify({ draft: session.draft, experimentTags: session.experimentTags || [] }));
+                                if (!part || part === "all") storage.removeItem(wizardSessionKey); // migrate off legacy key
+                            } catch { /* best effort */ }
                         },
                         // The workspace drafts a character name; on Apply it
                         // routes through these so creation/selection reuse the
