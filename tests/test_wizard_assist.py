@@ -260,6 +260,10 @@ def test_clean_assist_draft_errors():
     assert _clean_assist_draft("nope") == (None, "draft must be an object")
     clean, err = _clean_assist_draft({"sex": "f"})
     assert err is None and clean["sex"] == "female" and clean["age"] == 18
+    # workspace-internal routing keys must never survive into the model draft
+    clean2, err2 = _clean_assist_draft({"name": "Luminoth", "hair": "silver_hair"})
+    assert err2 is None
+    assert clean2 is not None and "name" not in clean2 and clean2["hair"] == "silver_hair"
 
 
 # --- _sanitize_assist_value ---------------------------------------------------

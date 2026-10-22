@@ -1,6 +1,6 @@
 import { createStylePicker } from "./character_styles.mjs?v=style-mix-5";
 import { createSakuraInteractions } from "./sakura_interactions.mjs";
-import { openWizardWorkspace } from "./vnccs_wizard_workspace.mjs?v=ws-4";
+import { openWizardWorkspace } from "./vnccs_wizard_workspace.mjs?v=ws-5";
 import { app } from "../../scripts/app.js";
 window.__vnccsCreatorBuild = "queue-job-2026-10-21a";
 import { vnccsApi as api, mediaURL, checkedJSON, storage, refreshPreviewImage, watchConnection } from "./vnccs_transport.js";
@@ -3786,6 +3786,26 @@ app.registerExtension({
                         beginCharacterWizardRequest,
                         saveState,
                         ensureQwenVLReady,
+                        // The workspace drafts a character name; on Apply it
+                        // routes through these so creation/selection reuse the
+                        // same guarded path as the node's own New Character.
+                        createCharacterByName: async (n) => {
+                            const trimmed = String(n || "").trim();
+                            if (!trimmed) throw new Error("Name is empty.");
+                            await checkedJSON("/vnccs/create", { method: "POST", body: JSON.stringify({ name: trimmed, catalog: "creator_v2" }) });
+                            if (!Array.from(els.charSelect.options).some(o => o.value === trimmed)) {
+                                els.charSelect.add(new Option(trimmed, trimmed));
+                            }
+                            if (await loadChar(trimmed, false, "new")) throw new Error("Character load was superseded.");
+                        },
+                        selectCharacterByName: async (n) => {
+                            const trimmed = String(n || "").trim();
+                            if (!trimmed) throw new Error("Name is empty.");
+                            if (!Array.from(els.charSelect.options).some(o => o.value === trimmed)) {
+                                throw new Error(`Character “${trimmed}” is not in the list.`);
+                            }
+                            if (await loadChar(trimmed, false, "switch")) throw new Error("Character load was superseded.");
+                        },
                     });
                 };
 

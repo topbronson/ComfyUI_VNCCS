@@ -141,7 +141,7 @@ function makeApi(t) {
     };
 }
 
-async function mount(seed = {}) {
+async function mount(seed = {}, opts = {}) {
     const t = { requests: [], failNext: null };
     const info = {
         sex: "female", age: 20, race: "human", skin_color: "", body: "slim",
@@ -152,12 +152,14 @@ async function mount(seed = {}) {
     const ctx = {
         node: { id: 5 },
         state: { character: "QA-Vex", character_info: info, gen_settings: { generation_mode: "qi2" } },
-        els: {},
+        els: opts.els || {},
         api: makeApi(t),
         applyCharacterWizardData: data => applied.push(data),
         beginCharacterWizardRequest: () => () => true,
         saveState() {},
         ensureQwenVLReady: async () => true,
+        createCharacterByName: opts.create,
+        selectCharacterByName: opts.select,
     };
     const { openWizardWorkspace } = await import("../web/vnccs_wizard_workspace.mjs");
     const handle = await openWizardWorkspace(ctx);
@@ -338,10 +340,11 @@ test("names and review render sanitized chips; accept applies suggestion", async
     fire(w.send(), "click");
     await settle();
     const names = findAll(w.panel, e => e._classes.has("vnccs-ws-chip")).map(e => e.textContent);
-    assert.deepEqual(names.filter(n => n === "Aria" || n === "Brea").sort(), ["Aria", "Brea"]);
-    fire(findAll(w.panel, e => e.textContent === "Aria")[0], "click");
+    assert.deepEqual(names.filter(n => /Aria|Brea/.test(n || "")).sort(),
+        ["Use \u201cAria\u201d", "Use \u201cBrea\u201d"], "suggestions render Use chips");
+    fire(findAll(w.panel, e => e.textContent === "Copy")[0], "click");
     await settle();
-    assert.equal(globalThis.__copied, "Aria", "name chip copies via clipboard");
+    assert.equal(globalThis.__copied, "Aria", "copy chip still copies via clipboard");
     fire(findText(w.panel, "Review"), "click");
     fire(w.send(), "click");
     await settle();
@@ -387,3 +390,89 @@ test("Enter in console sends; Shift+Enter does not", async () => {
     await settle();
     assert.equal(w.t.requests.filter(r => r.route === "/vnccs/wizard/assist").length, before + 1);
 });
+
+// ── name routing: Names -> name field -> create/switch on Apply ─────────────
+
+test("names: Use fills the name row and preview-hints a new character", async () => {
+    const w = await mount();
+    const nameRow = w.draftRow("Character name");
+    assert.ok(nameRow, "draft sheet has a Character name row");
+    assert.equal(nameRow.children[1].value, "", "name starts empty = keep current character");
+    fire(findText(w.panel, "Names"), "click");
+    fire(w.send(), "click");
+    await settle();
+    const use = findAll(w.panel, e => e.textContent === 'Use \u201cAria\u201d')[0];
+    assert.ok(use, "name suggestions offer a Use button");
+    fire(use, "click");
+    assert.equal(w.draftRow("Character name").children[1].value, "Aria");
+    const hint = findAll(w.panel, e => (e.textContent || "").includes('will be created'))[0];
+    assert.ok(hint, "hint states a new character will be created on Apply");
+    assert.equal(w.applied.length, 0, "still no node mutation before Apply");
+    w.close();
+});
+
+test("apply with new name: confirm, create via ctx, then fill fields (name never leaks)", async () => {
+    const created = [];
+    const w = await mount({}, { create: async (n) => { created.push(n); w.ctx.state.character = n; } });
+    w.draftRow("Character name").children[1].value = "Luminoth";
+    fire(w.draftRow("Character name").children[1], "input");
+    fire(findText(w.panel, "Apply & Close"), "click");
+    await settle();
+    assert.equal(w.applied.length, 0, "must not apply without confirmation");
+    const confirm = findText(w.panel, 'Create \u201cLuminoth\u201d & apply');
+    assert.ok(confirm, "create-and-apply confirmation chip offered");
+    fire(confirm, "click");
+    await settle();
+    assert.deepEqual(created, ["Luminoth"], "creation routed through ctx.createCharacterByName");
+    assert.equal(w.applied.length, 1, "fields applied after creation");
+    assert.ok(!("name" in w.applied[0]), "name must never reach applyCharacterWizardData");
+    assert.equal(w.applied[0].hair, "green_hair");
+});
+
+test("apply with existing other name: switch via ctx, not create", async () => {
+    const selected = [], created = [];
+    const els = { charSelect: { options: [{ value: "QA-Vex" }, { value: "Diora" }] } };
+    const w = await mount({}, {
+        els,
+        create: async (n) => { created.push(n); },
+        select: async (n) => { selected.push(n); w.ctx.state.character = n; },
+    });
+    w.draftRow("Character name").children[1].value = "diora"; // case-insensitive match
+    fire(w.draftRow("Character name").children[1], "input");
+    fire(findText(w.panel, "Apply & Close"), "click");
+    await settle();
+    const confirm = findText(w.panel, 'Switch to \u201cdiora\u201d & apply');
+    assert.ok(confirm, "switch-and-apply chip offered for existing character");
+    fire(confirm, "click");
+    await settle();
+    assert.deepEqual(selected, ["diora"]);
+    assert.equal(created.length, 0, "must not create when the character exists");
+    assert.equal(w.applied.length, 1);
+});
+
+test("apply with empty or same-case name: no confirmation, node only", async () => {
+    const w = await mount();
+    fire(findText(w.panel, "Apply & Close"), "click");
+    await settle();
+    assert.equal(w.applied.length, 1, "empty name applies straight through");
+    assert.ok(!("name" in w.applied[0]));
+
+    const w2 = await mount();
+    w2.draftRow("Character name").children[1].value = "qa-vex"; // same as current, case-folded
+    fire(w2.draftRow("Character name").children[1], "input");
+    fire(findText(w2.panel, "Apply & Close"), "click");
+    await settle();
+    assert.equal(w2.applied.length, 1, "same-name apply is not a create flow");
+});
+
+test("names payload never carries the draft name to the assist API", async () => {
+    const w = await mount();
+    fire(findText(w.panel, "Names"), "click");
+    fire(w.send(), "click");
+    await settle();
+    const call = w.t.requests.filter(r => r.route === "/vnccs/wizard/assist").at(-1);
+    const sentDraft = JSON.parse(call.options.body).draft;
+    assert.ok(call && !("name" in sentDraft), "assist draft payload must be name-free");
+    w.close();
+});
+

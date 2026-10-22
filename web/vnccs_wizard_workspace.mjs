@@ -38,6 +38,7 @@ const CSS = `
   padding: 6px 8px; font: inherit; outline: none; }
 .vnccs-ws-row input:focus, .vnccs-ws-row textarea:focus, .vnccs-ws-input:focus { border-color: #5b8bd0; }
 .vnccs-ws-row.modified input, .vnccs-ws-row.modified textarea { border-color: #c9973f; }
+.vnccs-ws-name-hint { font-size: 10px; color: #c9973f; min-height: 12px; }
 .vnccs-ws-flash { animation: vnccsWsFlash .7s ease; }
 @keyframes vnccsWsFlash { 0% { box-shadow: 0 0 0 2px #7fd08a; } 100% { box-shadow: none; } }
 .vnccs-ws-grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
@@ -95,11 +96,22 @@ const catalogCache = {};
 
 function seedDraft(info) {
     const draft = {};
+    // "" means "keep the current character"; a typed value becomes a
+    // create-on-Apply target (see the Apply button handler).
+    draft.name = "";
     draft.sex = info.sex === "male" ? "male" : "female";
     const age = parseInt(info.age, 10);
     draft.age = Number.isFinite(age) ? Math.max(1, Math.min(100, age)) : 18;
     for (const f of TEXT_FIELDS) draft[f.key] = String(info[f.key] ?? "");
     return draft;
+}
+
+function stripName(d) {
+    // name is workspace-only routing state; it must never reach the assist
+    // model or the node's character_info fields.
+    const copy = { ...d };
+    delete copy.name;
+    return copy;
 }
 
 function newRequestId() {
@@ -112,6 +124,8 @@ export async function openWizardWorkspace(ctx) {
     const character = state.character;
     const currentRequest = ctx.beginCharacterWizardRequest();
     const isCurrent = () => currentRequest() && !node._vnccsStateRestoreError && state.character === character;
+    const existingCharacter = (name) => Array.from(els.charSelect?.options || [])
+        .some(o => String(o.value).toLowerCase() === String(name).toLowerCase());
 
     injectStyles(CSS, "vnccs-wizard-workspace");
 
@@ -165,6 +179,33 @@ export async function openWizardWorkspace(ctx) {
         const h = document.createElement("h4");
         h.textContent = "Draft sheet (edits stay here until Apply)";
         draftPane.appendChild(h);
+
+        // Character name: empty = apply to the current character. A new name
+        // turns Apply into "create the character, then fill its fields".
+        const nameRow = document.createElement("div");
+        nameRow.className = "vnccs-ws-row";
+        const nameLabel = document.createElement("label");
+        nameLabel.textContent = "Character name";
+        const nameInp = document.createElement("input");
+        nameInp.type = "text";
+        nameInp.className = "vnccs-ws-name";
+        nameInp.maxLength = 40;
+        nameInp.value = draft.name || "";
+        nameInp.placeholder = `keep “${state.character || "current"}” — or type a new name`;
+        const nameHint = document.createElement("span");
+        nameHint.className = "vnccs-ws-name-hint";
+        const updateNameHint = () => {
+            const n = (draft.name || "").trim();
+            if (!n) { nameHint.textContent = ""; }
+            else if (n.toLowerCase() === String(state.character || "").toLowerCase()) { nameHint.textContent = "same as current character"; }
+            else if (existingCharacter(n)) { nameHint.textContent = `“${n}” exists — Apply switches to it`; }
+            else { nameHint.textContent = `new character “${n}” will be created on Apply`; }
+        };
+        nameInp.addEventListener("input", () => { draft.name = nameInp.value; markDirty(); updateNameHint(); });
+        nameRow.append(nameLabel, nameInp, nameHint);
+        draftPane.appendChild(nameRow);
+        rowsByKey.name = nameRow;
+        updateNameHint();
 
         const sexAge = document.createElement("div");
         sexAge.className = "vnccs-ws-grid2";
@@ -409,14 +450,14 @@ export async function openWizardWorkspace(ctx) {
         if (action === "draft") {
             payload.description = text;
             payload.history = draftConvo.slice(-12);
-            payload.draft = { ...draft };
+            payload.draft = stripName(draft);
             draftConvo.push({ role: "user", text });
         }
         else if (action === "reroll_field" || action === "polish_field") {
-            payload.field = fieldSel.value; payload.instruction = text; payload.draft = { ...draft };
-        } else if (action === "edit_command") { payload.instruction = text; payload.draft = { ...draft }; }
-        else if (action === "names") { payload.draft = { ...draft }; payload.count = 5; }
-        else { payload.draft = { ...draft }; }
+            payload.field = fieldSel.value; payload.instruction = text; payload.draft = stripName(draft);
+        } else if (action === "edit_command") { payload.instruction = text; payload.draft = stripName(draft); }
+        else if (action === "names") { payload.draft = stripName(draft); payload.count = 5; }
+        else { payload.draft = stripName(draft); }
         inputEl.value = "";
         lastCall = { action, payload };
         await assist(action, payload);
@@ -622,17 +663,34 @@ export async function openWizardWorkspace(ctx) {
         }
         if (action === "names") {
             const t = turn("model");
-            t.textContent = "Name ideas (click to copy):";
+            t.textContent = "Name ideas:";
             if (!data.suggestions?.length) { t.textContent += " (none survived filtering)"; addMeta(t, meta); return; }
             chipRow(t, data.suggestions, (n) => {
-                const b = document.createElement("button");
-                b.className = "vnccs-ws-chip";
-                b.textContent = n;
-                b.addEventListener("click", async () => {
-                    try { await navigator.clipboard.writeText(n); infoTurn(`Copied “${n}” — rename the character in the node if you like it.`); }
+                const wrap = document.createElement("span");
+                wrap.style.display = "inline-flex";
+                wrap.style.gap = "4px";
+                const useBtn = document.createElement("button");
+                useBtn.className = "vnccs-ws-chip";
+                useBtn.textContent = `Use “${n}”`;
+                useBtn.addEventListener("click", () => {
+                    draft.name = n;
+                    markDirty();
+                    renderDraftSheet();
+                    const same = n.toLowerCase() === String(state.character || "").toLowerCase();
+                    infoTurn(same
+                        ? `Name “${n}” matches the current character — Apply just fills the fields.`
+                        : `Name “${n}” set — Apply will ${existingCharacter(n) ? `switch to “${n}” and fill its fields` : `create a new character “${n}” and fill its fields`}.`);
+                });
+                const copyBtn = document.createElement("button");
+                copyBtn.className = "vnccs-ws-chip ghost";
+                copyBtn.textContent = "Copy";
+                copyBtn.title = "Copy to clipboard";
+                copyBtn.addEventListener("click", async () => {
+                    try { await navigator.clipboard.writeText(n); infoTurn(`Copied “${n}”.`); }
                     catch (e) { infoTurn(`Name: ${n}`); }
                 });
-                return b;
+                wrap.append(useBtn, copyBtn);
+                return wrap;
             });
             addMeta(t, meta);
             return;
@@ -750,6 +808,40 @@ export async function openWizardWorkspace(ctx) {
     closeBtn.addEventListener("click", () => confirmClose());
     applyBtn.addEventListener("click", () => {
         if (!isCurrent()) { close(); return; }
+        const n = (draft.name || "").trim();
+        const current = String(state.character || "");
+        if (n && n.toLowerCase() !== current.toLowerCase()) {
+            // Name routes the apply: confirm create-or-switch, never silently
+            // touch a different character than the one the node has selected.
+            const existing = existingCharacter(n);
+            const t = turn("model");
+            t.textContent = existing
+                ? `“${n}” already exists. Switch to it and apply the draft fields there?`
+                : `“${n}” is not a character yet. Create a new character “${n}” and apply the draft fields to it?`;
+            chipRow(t, [true, false], (ok) => {
+                const b = document.createElement("button");
+                b.className = ok ? "vnccs-ws-chip" : "vnccs-ws-chip ghost";
+                b.textContent = ok ? (existing ? `Switch to “${n}” & apply` : `Create “${n}” & apply`) : "Cancel";
+                b.addEventListener("click", async () => {
+                    if (!ok) { infoTurn("Kept the current character. Edit the name field or press Apply again."); return; }
+                    try {
+                        if (existing) await ctx.selectCharacterByName?.(n);
+                        else await ctx.createCharacterByName?.(n);
+                    } catch (e) {
+                        errorTurn({ message: `Could not ${existing ? "switch to" : "create"} “${n}”: ${e?.message || e}` });
+                        return;
+                    }
+                    draft.name = ""; // consumed: it would only re-trigger the prompt
+                    doApplyFields();
+                });
+                return b;
+            });
+            return;
+        }
+        doApplyFields();
+    });
+
+    function doApplyFields() {
         // Apply is the only bridge to node state: experiment tags cross with
         // every other field, still sanitized server-side at prompt time.
         try {
@@ -758,8 +850,8 @@ export async function openWizardWorkspace(ctx) {
         } catch (e) { /* node-side errors are its own */ }
         // close first so the animated row fill on the node is visible
         close();
-        try { ctx.applyCharacterWizardData({ ...draft }); } catch (e) { /* node-side errors are its own */ }
-    });
+        try { ctx.applyCharacterWizardData(stripName(draft)); } catch (e) { /* node-side errors are its own */ }
+    }
 
     // ---- keyboard, close, lifecycle ----------------------------------------
     function confirmClose() {
