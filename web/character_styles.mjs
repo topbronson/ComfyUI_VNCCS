@@ -2,7 +2,7 @@ import { mountSakuraDialogMotion } from "./sakura_interactions.mjs";
 
 // Style selection stays in widget_data; the user library lives on the server.
 export function createStylePicker({ host, catalog, getInfo, save, fetchApi, cleanup,
-    getPreviewPayload, imageURL = value => value, listenPreview, showModal, allowNone = () => false, runCharacterPreview = null,
+    getPreviewPayload, getCharacter = () => "", imageURL = value => value, listenPreview, showModal, allowNone = () => false, runCharacterPreview = null,
     catalogURL = () => "/vnccs/character_styles", getSecondaryInfo, allowSecondary = () => true }) {
     const make = (tag, className, text) => {
         const element = document.createElement(tag);
@@ -64,6 +64,8 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
     let prefs = { favorites: [], sets: {} };
     let prefsRevision = 0;
     let setFilter = "";
+    let charPreviewsOn = localStorage.getItem("VNCCS_styleCharPreviews") !== "0";
+    let charPreviewBust = 0;
     let popover = null;
     let popoverOutside = null;
     let favCollapsed = false;
@@ -77,20 +79,30 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
     const setStatus = text => { if (!disposed && statusEl) statusEl.textContent = text; };
     let generatePreviews = async () => false;
     const hasPrimaryStyle = () => !["", "none"].includes(String(getInfo()?.style || "").trim().toLowerCase());
+    const charPreviewURL = style => {
+        if (!charPreviewsOn || !style?.id || style.id === "none") return "";
+        const character = String(getCharacter() || "");
+        const label = String(style.label || "");
+        if (!character || !label) return "";
+        return `/vnccs/get_style_cached_preview?character=${encodeURIComponent(character)}&style=${encodeURIComponent(label)}&t=${charPreviewBust}`;
+    };
     const paintPreview = (element, style) => {
         element.replaceChildren();
         const fallback = make("span", "", "Preview");
         element.append(fallback);
-        if (style?.image?.startsWith("/vnccs/character_styles/preview?")) {
+        const paint = (src, onError) => {
             const image = make("img", "vnccs-style-preview-image");
             image.alt = "";
             image.loading = "lazy";
             image.decoding = "async";
             fallback.hidden = true;
-            image.onerror = () => { image.remove(); fallback.hidden = false; };
-            image.src = imageURL(style.image);
+            image.onerror = () => { image.remove(); fallback.hidden = false; onError?.(); };
+            image.src = imageURL(src);
             element.append(image);
-        }
+        };
+        const original = () => { if (style?.image?.startsWith("/vnccs/character_styles/preview?")) paint(style.image); };
+        const character = charPreviewURL(style);
+        if (character) paint(character, original); else original();
     };
     listenPreview?.(event => {
         const detail = event.detail;
@@ -266,12 +278,13 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
             updateGallery();
             try {
                 await runCharacterPreview(style.id);
+                charPreviewBust++;
                 if (!current.cancelled) progressMessage = `Saved creator preview ${index + 1}/${styles.length}: ${style.label}`;
             } catch (error) {
                 failures++;
                 progressMessage = `Creator preview ${index + 1}/${styles.length} failed (${style.label}: ${error?.message || error}). Completed previews are kept.`;
             }
-            updateGallery();
+            updateGallery(style.id);
         }
         progressMessage = current.cancelled
             ? "Stopped. Creator previews rendered so far are saved."
@@ -286,15 +299,17 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
     const openSetsMenu = anchor => openPopover(anchor, buildSetsMenuItems);
     const buildSetsMenuItems = () => {
         const names = Object.keys(prefs.sets);
-        const items = [];
-        if (!names.length) items.push({ label: "No sets yet — create one below", onClick: async () => {}, title: "" });
-        for (const name of names) {
-            const count = (prefs.sets[name] || []).length;
-            items.push({
-                label: `${setFilter === name ? "◉" : "○"} ${name} (${count})`,
-                title: "Filter the library to this set (click again to clear)",
-                onClick: async () => { setFilter = setFilter === name ? "" : name; refreshLibrary(); refreshPopover(); },
-            });
+        if (!names.length) return [{ label: "No sets yet — create one with the … button", onClick: async () => {}, title: "" }];
+        return names.map(name => ({
+            label: `${setFilter === name ? "◉" : "○"} ${name} (${(prefs.sets[name] || []).length})`,
+            title: "Filter the library to this set (click again to clear)",
+            onClick: async () => { setFilter = setFilter === name ? "" : name; refreshLibrary(); refreshPopover(); },
+        }));
+    };
+    const buildSetsActionItems = () => {
+        const items = [{ label: "+ New set…", onClick: () => promptNewSet() }];
+        for (const name of Object.keys(prefs.sets)) {
+            items.push({ divider: true });
             items.push({ label: `Rename ${name}…`, onClick: () => askText({
                 title: `Rename set “${name}”`, submitText: "Rename", initial: name,
                 onSubmit: async value => {
@@ -314,8 +329,6 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
                 },
             }) });
         }
-        items.push({ divider: true });
-        items.push({ label: "+ New set…", onClick: () => promptNewSet() });
         return items;
     };
     const openTileSetsMenu = (anchor, style) => openPopover(anchor, () => buildTileSetsMenuItems(style));
@@ -358,9 +371,22 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
         const filter = make("select", "vnccs-creator-select");
         filter.setAttribute("aria-label", "Style category");
         const setsBtn = make("button", "vnccs-creator-btn", "Sets ▾");
-        setsBtn.title = "Style sets: create sets, add styles from each card's Sets button, then filter, rename, delete, or queue a preview run for a set.";
+        setsBtn.title = "Pick a set to filter the library (styles from every card can join a set via its Sets button). Manage sets with the … button."
         setsBtn.onclick = () => { if (batch || deleting || !editor.hidden) return; openSetsMenu(setsBtn); };
         setsBtn.hidden = editingSecondary;
+        const setsMore = make("button", "vnccs-creator-btn", "…");
+        setsMore.title = "Set actions: create a new set, rename, or delete.";
+        setsMore.onclick = () => { if (batch || deleting || !editor.hidden) return; openPopover(setsMore, buildSetsActionItems); };
+        setsMore.hidden = editingSecondary;
+        const charToggle = make("button", "vnccs-creator-btn", charPreviewsOn ? "Char previews ✓" : "Char previews");
+        charToggle.title = "Show the current character's own preview renders on style cards (set by Batch Set Previews or Generate preview). Turn off to always show the original style-library thumbnails.";
+        charToggle.onclick = () => {
+            charPreviewsOn = !charPreviewsOn;
+            localStorage.setItem("VNCCS_styleCharPreviews", charPreviewsOn ? "1" : "0");
+            charToggle.textContent = charPreviewsOn ? "Char previews ✓" : "Char previews";
+            charPreviewBust++;
+            render();
+        };
         const batchBtn = make("button", "vnccs-creator-btn", "Batch Set Previews");
         batchBtn.title = "Queue preview renders for every style in the set currently selected in the Sets menu, using the current Creator settings. While a run is active this button stops it after the current image.";
         batchBtn.onclick = () => {
@@ -376,7 +402,7 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
         const dismiss = make("button", "vnccs-creator-btn", "Close");
         dismiss.title = "Close the library and stop after the current preview";
         dismiss.onclick = () => close();
-        header.append(search, filter, setsBtn, batchBtn, add, generateAll, dismiss);
+        header.append(search, filter, setsBtn, setsMore, charToggle, batchBtn, add, generateAll, dismiss);
         const sizeControls = make("label", "vnccs-style-size-controls", "Card size");
         const sizeSlider = make("input", "vnccs-style-size-slider");
         sizeSlider.type = "range";
@@ -707,6 +733,7 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
                         if (item) item.image = result.image;
                     }
                     if (style.id === "custom") custom.image = result.image;
+                    charPreviewBust++;
                     progressMessage = `Saved ${index + 1}/${styles.length}: ${style.label} (${result.width} × ${result.height}, WebP)`;
                     updateGallery(style.id);
                 }
@@ -722,6 +749,7 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
         };
         refreshLibrary = () => { requestId++; loadingCatalog = false; updateFilters(); render(); };
         updateFilters();
+        charPreviewBust++;
         render();
         refreshPrefs().then(() => { if (!disposed && overlay) render(); }).catch(() => {});
         const token = ++requestId;

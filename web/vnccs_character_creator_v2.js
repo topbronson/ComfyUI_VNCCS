@@ -1,4 +1,4 @@
-import { createStylePicker } from "./character_styles.mjs?v=style-mix-6";
+import { createStylePicker } from "./character_styles.mjs?v=style-mix-7";
 import { createSakuraInteractions } from "./sakura_interactions.mjs";
 import { openWizardWorkspace } from "./vnccs_wizard_workspace.mjs?v=ws-8";
 import { app } from "../../scripts/app.js";
@@ -2935,6 +2935,7 @@ app.registerExtension({
                         host: container, catalog: styleCatalogForMode(state.gen_settings.generation_mode),
                         catalogURL: () => styleCatalogURL(state.gen_settings.generation_mode),
                         getInfo: () => state.character_info,
+                        getCharacter: () => state.character || "", 
                         getSecondaryInfo: () => state.character_info.secondary_style ||= { style: "none" },
                         allowSecondary: () => ["anima", "illustrious"].includes(state.gen_settings.generation_mode),
                         allowNone: () => state.gen_settings.generation_mode !== "qi2",
