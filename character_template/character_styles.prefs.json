@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "favorites": [],
+  "sets": {
+    "basic pass": [],
+    "anime eras": [
+      "anime_1970s",
+      "anime_1980s",
+      "anime_1990s",
+      "anime_2000s",
+      "anime_2010s",
+      "anime_2020s"
+    ],
+    "Animation": [],
+    "quuickset": []
+  }
+}

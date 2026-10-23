@@ -161,7 +161,8 @@ QI2_DEFAULTS = {
     "qi2_cache": {"device": "gpu", "dtype": "int8"},
 }
 QI2_TEXT_GENERATION_DEFAULTS = {
-    "max_length": 2048,
+    # Measured 2026-10-23: n=54 real rewrite/wizard calls, completion max 536 (median 254).
+    "max_length": 1024,
     "sampling_mode": {
         "sampling_mode": "on",
         "temperature": 0.3,
@@ -1059,7 +1060,7 @@ def _wizard_via_remote(system_prompt, user_prompt, backend):
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "max_tokens": int(backend.get("max_tokens", 900)),
+        "max_tokens": int(backend.get("max_tokens", 768)),
         "temperature": float(backend.get("temperature", 0.3)),
     }
     timeout = float(backend.get("timeout", 120))
@@ -2924,7 +2925,8 @@ if server:
                     ))
                     if action == "draft":
                         # JSON + design rationale needs more room than the other actions.
-                        assist_backend["max_tokens"] = max(int(backend.get("max_tokens", 900)), 1400)
+                        # Measured 2026-10-23: n=54 real calls, completion max 536 (median 254).
+                        assist_backend["max_tokens"] = max(int(backend.get("max_tokens", 768)), 1024)
                     content, model_used = _wizard_via_remote(system_prompt, user_prompt, assist_backend)
                     log_event("wizard_assist", component="Creator", action=action, model=model_used,
                               elapsed=round(time.time() - started, 1), truncate=False)
