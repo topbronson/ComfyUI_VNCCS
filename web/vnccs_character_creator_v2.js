@@ -1,4 +1,4 @@
-import { createStylePicker } from "./character_styles.mjs?v=style-mix-7";
+import { createStylePicker } from "./character_styles.mjs?v=style-mix-8";
 import { createSakuraInteractions } from "./sakura_interactions.mjs";
 import { openWizardWorkspace } from "./vnccs_wizard_workspace.mjs?v=ws-8";
 import { app } from "../../scripts/app.js";
@@ -316,20 +316,22 @@ ${SAKURA_THEME_CSS}
 }
 .vnccs-creator-container .vnccs-style-fav-toggle:hover { color: var(--text-primary); background: var(--bg-hover); }
 .vnccs-style-fav-grid { margin-bottom: 14px; }
-.vnccs-creator-container .vnccs-style-gallery .vnccs-style-popover {
+.vnccs-style-popover {
     position: fixed; z-index: 120; display: flex; flex-direction: column; gap: 2px;
     min-width: 230px; max-width: 320px; max-height: 60vh; overflow-y: auto;
-    padding: 6px; border-radius: 10px; border: 1px solid var(--accent-border);
-    background: var(--bg-surface); box-shadow: 0 14px 36px rgba(0, 0, 0, 0.55);
+    padding: 6px; border-radius: 10px; border: 1px solid var(--accent-border, #3a3a48);
+    background: var(--bg-surface, #1c1c24); box-shadow: 0 14px 36px rgba(0, 0, 0, 0.55);
+    /* Portal-mounted to <body>: theme vars may be scoped to the creator container, so every var needs a fallback. */
+    color: var(--text-primary, #d8d8e2); font-size: 12px;
 }
-.vnccs-creator-container .vnccs-style-popover button {
-    text-align: left; background: none; border: none; color: var(--text-primary);
+.vnccs-style-popover button {
+    text-align: left; background: none; border: none; color: var(--text-primary, #d8d8e2);
     font-size: 12px; padding: 7px 8px; border-radius: 6px; cursor: pointer;
 }
-.vnccs-creator-container .vnccs-style-popover button:hover:not(:disabled) { background: var(--bg-hover); }
-.vnccs-creator-container .vnccs-style-popover button:disabled { opacity: 0.5; cursor: wait; }
-.vnccs-creator-container .vnccs-style-popover .vnccs-style-popover-danger { color: var(--error); }
-.vnccs-style-popover-divider { border: none; border-top: 1px solid var(--accent-border); margin: 4px 2px; }
+.vnccs-style-popover button:hover:not(:disabled) { background: var(--bg-hover, rgba(255, 255, 255, 0.08)); }
+.vnccs-style-popover button:disabled { opacity: 0.5; cursor: wait; }
+.vnccs-style-popover .vnccs-style-popover-danger { color: var(--error, #e5484d); }
+.vnccs-style-popover-divider { border: none; border-top: 1px solid var(--accent-border, #3a3a48); margin: 4px 2px; }
 .vnccs-creator-container .vnccs-style-editor { max-width: 720px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
 .vnccs-creator-container .vnccs-style-editor textarea { height: auto; min-height: 160px; resize: vertical; }
 .vnccs-creator-container .vnccs-style-gallery [hidden] { display: none; }

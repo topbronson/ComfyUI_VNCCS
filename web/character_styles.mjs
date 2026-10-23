@@ -216,7 +216,10 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
         };
         box._vnccsFill = fill;
         fill();
-        overlay.append(box);
+        // Portal to <body>: LiteGraph's dom-widget layer carries a CSS
+        // transform (canvas zoom), which would make this position:fixed
+        // popover's viewport coordinates scale/shift offscreen.
+        document.body.append(box);
         const rect = anchor.getBoundingClientRect();
         const size = box.getBoundingClientRect();
         box.style.top = `${Math.min(window.innerHeight - size.height - 8, rect.bottom + 6)}px`;
@@ -372,11 +375,19 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
         filter.setAttribute("aria-label", "Style category");
         const setsBtn = make("button", "vnccs-creator-btn", "Sets ▾");
         setsBtn.title = "Pick a set to filter the library (styles from every card can join a set via its Sets button). Manage sets with the … button."
-        setsBtn.onclick = () => { if (batch || deleting || !editor.hidden) return; openSetsMenu(setsBtn); };
+        setsBtn.onclick = () => {
+            if (deleting) return;
+            if (batch) { setStatus("Finish or stop the current preview run first."); return; }
+            openSetsMenu(setsBtn);
+        };
         setsBtn.hidden = editingSecondary;
         const setsMore = make("button", "vnccs-creator-btn", "…");
         setsMore.title = "Set actions: create a new set, rename, or delete.";
-        setsMore.onclick = () => { if (batch || deleting || !editor.hidden) return; openPopover(setsMore, buildSetsActionItems); };
+        setsMore.onclick = () => {
+            if (deleting) return;
+            if (batch) { setStatus("Finish or stop the current preview run first."); return; }
+            openPopover(setsMore, buildSetsActionItems);
+        };
         setsMore.hidden = editingSecondary;
         const charToggle = make("button", "vnccs-creator-btn", charPreviewsOn ? "Char previews ✓" : "Char previews");
         charToggle.title = "Show the current character's own preview renders on style cards (set by Batch Set Previews or Generate preview). Turn off to always show the original style-library thumbnails.";
