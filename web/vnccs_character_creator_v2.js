@@ -206,6 +206,8 @@ ${SAKURA_THEME_CSS}
 }
 .vnccs-style-preview-image {
     position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover;
+    /* Crop from the bottom: portraits keep the head in frame and lose the feet. */
+    object-position: center top;
     border-radius: inherit;
 }
 .vnccs-style-summary > .vnccs-style-placeholder { width: 106.4px; flex-shrink: 0; }
