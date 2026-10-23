@@ -1082,7 +1082,7 @@ def _wizard_via_remote(system_prompt, user_prompt, backend):
         )
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+                raw_body = resp.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
             detail = ""
             try:
@@ -1092,9 +1092,28 @@ def _wizard_via_remote(system_prompt, user_prompt, backend):
             if attempt_with_kwargs and e.code == 400 and "chat_template_kwargs" in detail:
                 continue
             raise RuntimeError(f"wizard backend HTTP {e.code}: {detail}")
+        # Some OpenAI-compatible providers answer HTTP 200 even when they refuse
+        # the request (e.g. TensorFold's in-band "NoRoom" stream error). Treat
+        # those as remote failures so native_fallback fires instead of the
+        # wizard silently stalling on an empty reply.
+        try:
+            data = json.loads(raw_body)
+        except ValueError:
+            raise RuntimeError(
+                f"wizard backend returned non-JSON body (request refused?): {raw_body[:300]!r}"
+            )
+        if not isinstance(data, dict):
+            raise RuntimeError(f"wizard backend returned unexpected body: {raw_body[:300]!r}")
+        if data.get("error"):
+            raise RuntimeError(f"wizard backend in-band error: {json.dumps(data['error'])[:300]}")
         choices = data.get("choices") or []
         if not choices:
             raise RuntimeError(f"wizard backend returned no choices: {json.dumps(data)[:300]}")
+        finish_reason = choices[0].get("finish_reason")
+        if finish_reason not in (None, "stop", "length", "content_filter"):
+            raise RuntimeError(
+                f"wizard backend ended with finish_reason={finish_reason!r}: {json.dumps(data)[:300]}"
+            )
         return choices[0].get("message", {}).get("content", ""), model
     raise RuntimeError("wizard backend: no request attempt made")
 
@@ -1382,61 +1401,64 @@ def _build_assist_prompts(action, post):
                 f"{json.dumps(post['draft'], ensure_ascii=False)}\n"
             )
         tag_options = json.dumps(_extract_character_tag_options(CHARACTER_PRESETS), ensure_ascii=False)
-        user_prompt = f"""{history_block}
-{draft_block}
-The user's latest message: {post['description']}
-
-Produce the complete updated character as ONE JSON object with exactly these keys:
+        # Stable-first ordering: task text, rules and curated presets are byte-identical
+        # across calls so a prefix-caching provider reuses ONE cached state per action;
+        # the volatile conversation, draft and latest message sit at the tail.
+        user_prompt = f"""Produce the complete updated character as ONE JSON object with exactly these keys:
 {{"sex": "...", "age": ..., "race": "...", "skin_color": "...", "body": "...", "face": "...", "hair": "...", "eyes": "...", "additional_details": "...", "rationale": "..."}}
 - sex is "female" or "male"; age is a number.
 - Fill EVERY field. Keep continuity with the earlier turns and the current draft; change only what the latest message asks (or clearly implies).
 - "rationale": 2-4 plain sentences addressed to the user explaining the decisions you made and WHY — what you drew from their idea (e.g. the mythology behind a requested deity), what you chose between alternatives, and which curated preset tags you used.
 
 {WIZARD_RULES_BLOCK}
-- Curated presets you may draw from: {tag_options}"""
+- Curated presets you may draw from: {tag_options}
+
+Earlier turns of this conversation (for continuity):{history_block}
+{draft_block}
+The user's latest message: {post['description']}"""
         return system_prompt, user_prompt
     draft = post["draft"]
     instruction = post.get("instruction", "")
     extra = f"\nExtra instruction from the user: {instruction}\n" if instruction else ""
-    common = (
-        f"Current character draft (JSON):\n{json.dumps(draft, ensure_ascii=False)}\n\n"
-        f"{WIZARD_RULES_BLOCK}\n"
-    )
     tag_options = json.dumps(_extract_character_tag_options(CHARACTER_PRESETS), ensure_ascii=False)
+    # Stable-first ordering (see draft branch): task text + rules + curated presets
+    # stay byte-identical across calls per action/field, so a prefix-caching provider
+    # keeps ONE cached state per action. The volatile draft JSON and any free-text
+    # extra instruction move to the tail.
+    stable_tail = (
+        f"\n{WIZARD_RULES_BLOCK}\n"
+        f"- Curated presets you may draw from: {tag_options}\n"
+    )
+    draft_tail = (
+        f"\nCurrent character draft (JSON):\n{json.dumps(draft, ensure_ascii=False)}\n"
+    )
     if action == "reroll_field":
         field = post["field"]
-        user_prompt = common + f"""
-Propose 4 distinct alternative values for the "{field}" field of this character, keeping the overall concept coherent.
-{extra}Curated presets you may draw from: {tag_options}
+        user_prompt = f"""Propose 4 distinct alternative values for the "{field}" field of this character, keeping the overall concept coherent.
 Return a raw JSON object with exactly one key:
 {{"suggestions": ["value1", "value2", "value3", "value4"]}}
-Each suggestion is the COMPLETE new value for the "{field}" field alone, as comma-separated prompt fragments."""
+Each suggestion is the COMPLETE new value for the "{field}" field alone, as comma-separated prompt fragments.""" + stable_tail + draft_tail + extra
     elif action == "polish_field":
         field = post["field"]
-        user_prompt = common + f"""
-Rewrite ONLY the "{field}" field, current value: {draft.get(field, "")!r}
+        user_prompt = f"""Rewrite ONLY the "{field}" field, current value: {draft.get(field, "")!r}
 Improve richness and clarity but KEEP the original concept and every trait it already mentions.
-{extra}Curated presets you may draw from: {tag_options}
 Return a raw JSON object with exactly one key:
-{{"value": "complete new value for the {field} field"}}"""
+{{"value": "complete new value for the {field} field"}}""" + stable_tail + draft_tail + extra
     elif action == "edit_command":
-        user_prompt = common + f"""
-Apply this user instruction to the character draft: "{instruction}"
+        user_prompt = f"""Apply this user instruction to the character draft: "{instruction}"
 Return the minimal patch as a raw JSON object:
 {{"patch": {{"<field>": "<complete new value>", ...}}, "note": "<optional short explanation>"}}
 Allowed field names: {", ".join(ASSIST_PATCH_KEYS)}.
-Each changed field must contain its COMPLETE new value (not a diff). Do not include fields the instruction does not change. If the instruction cannot be applied, return {{"patch": {{}}, "note": "why"}}."""
+Each changed field must contain its COMPLETE new value (not a diff). Do not include fields the instruction does not change. If the instruction cannot be applied, return {{"patch": {{}}, "note": "why"}}.""" + stable_tail + draft_tail
     elif action == "names":
-        user_prompt = common + f"""
-Propose {post["count"]} fitting character names for this character (short, pronounceable, matching the concept and setting).
+        user_prompt = f"""Propose {post["count"]} fitting character names for this character (short, pronounceable, matching the concept and setting).
 Return a raw JSON object with exactly one key:
-{{"suggestions": ["Name 1", "Name 2", ...]}}"""
+{{"suggestions": ["Name 1", "Name 2", ...]}}""" + stable_tail + draft_tail
     else:  # review
-        user_prompt = common + f"""
-Review this draft for internal inconsistencies and gaps: contradictory traits, species features mismatched with race, colors that clash, missing build descriptor, empty fields that clearly need a value.
+        user_prompt = f"""Review this draft for internal inconsistencies and gaps: contradictory traits, species features mismatched with race, colors that clash, missing build descriptor, empty fields that clearly need a value.
 Return a raw JSON object with exactly one key:
 {{"issues": [{{"field": "<one of {', '.join(ASSIST_TEXT_FIELDS)}, or empty>", "note": "<short issue>", "suggestion": "<optional complete replacement value for that field>"}}]}}
-Do not rewrite the draft; only flag issues. If the draft is consistent, return {{"issues": []}}."""
+Do not rewrite the draft; only flag issues. If the draft is consistent, return {{"issues": []}}.""" + stable_tail + draft_tail
     return system_prompt, user_prompt
 
 
