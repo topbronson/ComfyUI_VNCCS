@@ -2,7 +2,7 @@ import { mountSakuraDialogMotion } from "./sakura_interactions.mjs";
 
 // Style selection stays in widget_data; the user library lives on the server.
 export function createStylePicker({ host, catalog, getInfo, save, fetchApi, cleanup,
-    getPreviewPayload, imageURL = value => value, listenPreview, showModal, allowNone = () => false,
+    getPreviewPayload, imageURL = value => value, listenPreview, showModal, allowNone = () => false, runCharacterPreview = null,
     catalogURL = () => "/vnccs/character_styles", getSecondaryInfo, allowSecondary = () => true }) {
     const make = (tag, className, text) => {
         const element = document.createElement(tag);
@@ -249,14 +249,35 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
         setStatus(prefs.favorites.includes(styleId) ? "Added to favorites" : "Removed from favorites");
     };
     const runStyleSet = async name => {
-        if (batch) { await generatePreviews(); return; }
+        if (batch) { batch.cancelled = true; progressMessage = "Stopping after the current style is saved..."; updateGallery(); return; }
         const members = prefs.sets[name];
         if (!Array.isArray(members) || !members.length) { setStatus(`Set “${name}” has no styles yet — add some from a card’s Sets button.`); return; }
         const styles = allStyles().filter(style => members.includes(style.id) && style.id !== "none" && style.id !== "custom");
         if (!styles.length) { setStatus(`Set “${name}” holds no styles from this model catalog.`); return; }
-        const payload = JSON.parse(JSON.stringify(getPreviewPayload()));
-        payload.gen_settings = { ...payload.gen_settings, seed: 0, seed_mode: "fixed", mode_settings: {} };
-        await generatePreviews(styles, payload);
+        if (typeof runCharacterPreview !== "function") { setStatus("Character preview is not available from this picker."); return; }
+        const current = { cancelled: false, engine: "char" };
+        batch = current;
+        progressMessage = "";
+        updateGallery();
+        let failures = 0;
+        for (const [index, style] of styles.entries()) {
+            if (current.cancelled || disposed || !overlay) break;
+            progressMessage = `Creator preview ${index + 1}/${styles.length}: ${style.label}`;
+            updateGallery();
+            try {
+                await runCharacterPreview(style.id);
+                if (!current.cancelled) progressMessage = `Saved creator preview ${index + 1}/${styles.length}: ${style.label}`;
+            } catch (error) {
+                failures++;
+                progressMessage = `Creator preview ${index + 1}/${styles.length} failed (${style.label}: ${error?.message || error}). Completed previews are kept.`;
+            }
+            updateGallery();
+        }
+        progressMessage = current.cancelled
+            ? "Stopped. Creator previews rendered so far are saved."
+            : failures ? `Finished with ${failures} of ${styles.length} previews failed.` : `All ${styles.length} creator previews saved to the character.`;
+        batch = null;
+        if (!disposed) updateGallery();
     };
     const promptNewSet = () => askText({
         title: "New style set", submitText: "Create",

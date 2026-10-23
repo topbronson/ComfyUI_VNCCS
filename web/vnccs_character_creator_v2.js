@@ -1,4 +1,4 @@
-import { createStylePicker } from "./character_styles.mjs?v=style-mix-5";
+import { createStylePicker } from "./character_styles.mjs?v=style-mix-6";
 import { createSakuraInteractions } from "./sakura_interactions.mjs";
 import { openWizardWorkspace } from "./vnccs_wizard_workspace.mjs?v=ws-8";
 import { app } from "../../scripts/app.js";
@@ -2951,6 +2951,13 @@ app.registerExtension({
                             saveCurrentGenerationModeValues();
                             saveState();
                             return { node_id: String(node.id), character_info: state.character_info, gen_settings: state.gen_settings };
+                        },
+                        runCharacterPreview: async styleId => {
+                            if (node._vnccsStateRestoreError) throw new Error(node._vnccsStateRestoreError);
+                            if (!state.character) throw new Error("no character selected");
+                            if (els.btnGen?.disabled) throw new Error("the Creator is busy generating");
+                            picker.setValue(styleId, true);
+                            await doGenerate();
                         },
                         listenPreview: callback => {
                             api.addEventListener("vnccs.style_preview.stage", callback);
