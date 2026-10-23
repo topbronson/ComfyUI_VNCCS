@@ -65,6 +65,8 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
     let prefsRevision = 0;
     let setFilter = "";
     let charPreviewsOn = localStorage.getItem("VNCCS_styleCharPreviews") !== "0";
+    const selection = new Set();
+    let selectMode = false;
     let charPreviewBust = 0;
     let popover = null;
     let popoverOutside = null;
@@ -156,6 +158,8 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
     };
     clearSecondary.onclick = () => setValue("none", true, true);
     const close = (restoreFocus = true) => {
+        selection.clear();
+        selectMode = false;
         requestId++;
         if (batch) {
             batch.cancelled = true;
@@ -358,6 +362,7 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
         overlay.setAttribute("aria-label", "Style library");
         overlay.onkeydown = event => {
             if (popover && event.key === "Escape") { event.stopPropagation(); event.preventDefault(); closePopover(); return; }
+            if (event.key === "Escape" && selectMode) { event.stopPropagation(); event.preventDefault(); setSelectMode(false); return; }
             if (event.key === "Escape") { event.stopPropagation(); event.preventDefault(); close(); }
             if (event.key === "Tab") {
                 const controls = [...overlay.querySelectorAll("button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled)")].filter(el => !el.closest("[hidden]"));
@@ -413,7 +418,70 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
         const dismiss = make("button", "vnccs-creator-btn", "Close");
         dismiss.title = "Close the library and stop after the current preview";
         dismiss.onclick = () => close();
-        header.append(search, filter, setsBtn, setsMore, charToggle, batchBtn, add, generateAll, dismiss);
+        const selectBtn = make("button", "vnccs-creator-btn", "Select");
+        selectBtn.title = "Multi-select styles, then add or remove them from a set in one action.";
+        selectBtn.onclick = () => { if (batch || deleting) return; setSelectMode(!selectMode); };
+        const selectBar = make("div", "vnccs-style-select-bar");
+        selectBar.hidden = true;
+        const selCount = make("span", "vnccs-style-select-count", "0 selected");
+        const addSelBtn = make("button", "vnccs-creator-btn", "Add to set\u2026");
+        const removeSelBtn = make("button", "vnccs-creator-btn", "Remove from set");
+        const clearSelBtn = make("button", "vnccs-creator-btn", "Clear");
+        addSelBtn.onclick = () => { if (!selection.size || batch || deleting) return; openPopover(addSelBtn, () => buildSelectionSetItems("add_members")); };
+        removeSelBtn.onclick = () => { if (!selection.size || batch || deleting) return; openPopover(removeSelBtn, () => buildSelectionSetItems("remove_members")); };
+        clearSelBtn.onclick = () => { selection.clear(); render(); updateSelectBar(); };
+        selectBar.append(selCount, addSelBtn, removeSelBtn, clearSelBtn);
+        header.append(search, filter, setsBtn, setsMore, charToggle, selectBtn, batchBtn, add, generateAll, dismiss, selectBar);
+        const updateSelectBar = () => {
+            selCount.textContent = `${selection.size} selected`;
+            addSelBtn.disabled = removeSelBtn.disabled = !selection.size || !!batch || deleting;
+        };
+        const setSelectMode = on => {
+            selectMode = on;
+            selection.clear();
+            selectBtn.textContent = on ? "Done selecting" : "Select";
+            selectBar.hidden = !on;
+            updateSelectBar();
+            render();
+        };
+        const buildSelectionSetItems = action => {
+            const names = Object.keys(prefs.sets);
+            const items = [];
+            for (const name of names) {
+                const members = prefs.sets[name] || [];
+                const overlap = action === "add_members" ? members.filter(id => selection.has(id)).length : 0;
+                const suffix = action === "add_members" && overlap ? ` (${overlap} already in)` : "";
+                items.push({
+                    label: `${name} (${members.length})${suffix}`,
+                    title: action === "add_members" ? "Add every selected style to this set" : "Remove every selected style from this set",
+                    onClick: async () => {
+                        const count = selection.size;
+                        await postPrefs({ action, name, style_ids: [...selection] });
+                        refreshLibrary();
+                        setStatus(`${action === "add_members" ? "Added" : "Removed"} ${count} ${count === 1 ? "style" : "styles"} ${action === "add_members" ? "to" : "from"} \u201c${name}\u201d.`);
+                        refreshPopover();
+                    },
+                });
+            }
+            if (action === "add_members") {
+                items.push({ divider: true });
+                items.push({ label: "+ New set and add\u2026", onClick: () => askText({
+                    title: "New style set", submitText: "Create and add",
+                    onSubmit: async value => {
+                        const name = value.trim();
+                        if (!name) return;
+                        const count = selection.size;
+                        await postPrefs({ action: "create_set", name });
+                        await postPrefs({ action: "add_members", name, style_ids: [...selection] });
+                        refreshLibrary();
+                        setStatus(`Created \u201c${name}\u201d with ${count} ${count === 1 ? "style" : "styles"}.`);
+                        closePopover();
+                    },
+                }) });
+            }
+            if (!items.length) items.push({ label: "No sets yet \u2014 create one with \u2026 or \u201cNew set and add\u201d", onClick: async () => {}, title: "" });
+            return items;
+        };
         const sizeControls = make("label", "vnccs-style-size-controls", "Card size");
         const sizeSlider = make("input", "vnccs-style-size-slider");
         sizeSlider.type = "range";
@@ -469,6 +537,8 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
             generateAll.disabled = loadingCatalog || deleting || !editor.hidden || !!batch?.cancelled;
             batchBtn.textContent = batch ? (batch.cancelled ? "Stopping..." : "Stop batch") : "Batch Set Previews";
             batchBtn.disabled = loadingCatalog || deleting || !editor.hidden || !setFilter || !!batch?.cancelled;
+            selectBtn.disabled = !!batch || deleting;
+            updateSelectBar();
             if (batch) closePopover();
             for (const tileHost of [grid, favGrid]) {
                 for (const edit of tileHost.querySelectorAll(".vnccs-style-edit")) edit.disabled = !!batch || deleting;
@@ -513,7 +583,16 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
                 slots.push(placeholder);
                 previewSlots.set(style.id, slots);
                 card.append(placeholder, make("span", "vnccs-style-card-label", style.label));
+                if (selectMode && selection.has(style.id)) card.classList.add("vnccs-style-card--selected");
                 card.onclick = () => {
+                    if (selectMode) {
+                        if (style.id === "custom" || style.id === "none") return;
+                        if (selection.has(style.id)) selection.delete(style.id); else selection.add(style.id);
+                        card.classList.toggle("vnccs-style-card--selected", selection.has(style.id));
+                        card.setAttribute("aria-pressed", String(selection.has(style.id)));
+                        updateSelectBar();
+                        return;
+                    }
                     if (style.id === "custom") {
                         showEditor({ label: "Custom style", prompt: selectedInfo().custom_style || "", reference: "Your prompt" });
                     } else { setValue(style.id, true, editingSecondary); close(); }

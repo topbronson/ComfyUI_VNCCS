@@ -1,4 +1,4 @@
-import { createStylePicker } from "./character_styles.mjs?v=style-mix-8";
+import { createStylePicker } from "./character_styles.mjs?v=style-mix-10";
 import { createSakuraInteractions } from "./sakura_interactions.mjs";
 import { openWizardWorkspace } from "./vnccs_wizard_workspace.mjs?v=ws-8";
 import { app } from "../../scripts/app.js";
@@ -203,6 +203,15 @@ ${SAKURA_THEME_CSS}
     display: flex; align-items: center; justify-content: center; aspect-ratio: 1;
     background: linear-gradient(145deg, #292034, #17131f);
     color: var(--text-secondary); font-size: 11px; border-radius: 10px;
+}
+.vnccs-creator-container .vnccs-style-select-bar { display: flex; align-items: center; gap: 6px; margin: 0 0 6px; flex-wrap: wrap; flex-basis: 100%; }
+.vnccs-creator-container .vnccs-style-select-bar[hidden] { display: none; }
+.vnccs-creator-container .vnccs-style-select-count { font-size: 11px; color: var(--text-secondary); margin-right: 4px; }
+.vnccs-creator-container .vnccs-style-card--selected { outline: 2px solid var(--accent); outline-offset: -2px; }
+.vnccs-creator-container .vnccs-style-card--selected::after {
+    content: "\\2713"; position: absolute; top: 6px; right: 6px; width: 20px; height: 20px;
+    display: flex; align-items: center; justify-content: center; font-size: 12px;
+    background: var(--accent); color: #fff; border-radius: 50%; z-index: 1;
 }
 .vnccs-style-preview-image {
     position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover;

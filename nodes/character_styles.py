@@ -332,6 +332,42 @@ def delete_style_set(name):
     return _mutate_style_prefs(mutate)
 
 
+def _bulk_style_set_members(name, style_ids, add):
+    name = _clean_set_name(name)
+    if not isinstance(style_ids, (list, tuple)) or not style_ids:
+        raise ValueError("Select at least one style")
+    ids = []
+    for style_id in style_ids:
+        if not _valid_style_id(style_id):
+            raise ValueError("Invalid style ID")
+        if style_id not in ids:
+            ids.append(style_id)
+    def mutate(prefs):
+        members = prefs["sets"].get(name)
+        if members is None:
+            raise ValueError("Style set no longer exists")
+        if add:
+            for style_id in ids:
+                if style_id in members:
+                    continue
+                if len(members) >= _MAX_SET_MEMBERS:
+                    raise ValueError(f"A set holds up to {_MAX_SET_MEMBERS} styles")
+                members.append(style_id)
+        else:
+            for style_id in ids:
+                if style_id in members:
+                    members.remove(style_id)
+    return _mutate_style_prefs(mutate)
+
+
+def add_style_set_members(name, style_ids):
+    return _bulk_style_set_members(name, style_ids, True)
+
+
+def remove_style_set_members(name, style_ids):
+    return _bulk_style_set_members(name, style_ids, False)
+
+
 def toggle_style_set_member(name, style_id):
     name = _clean_set_name(name)
     if not _valid_style_id(style_id):

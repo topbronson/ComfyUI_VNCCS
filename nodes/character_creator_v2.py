@@ -46,7 +46,7 @@ from .character_styles import (
     load_user_styles, save_user_style, delete_user_style, style_preview_path, style_preview_url,
     square_style_resolution, save_style_preview, save_user_style_preview,
     load_style_prefs, toggle_style_favorite, create_style_set, rename_style_set,
-    delete_style_set, toggle_style_set_member,
+    delete_style_set,    toggle_style_set_member, add_style_set_members, remove_style_set_members,
     STYLE_PREVIEWS_DIR,
 )
 from . import vnccs_control_center as control_center
@@ -2505,12 +2505,12 @@ if server:
     @privileged_route
     async def post_style_prefs(request):
         try:
-            if request.content_length is not None and request.content_length > 8192:
+            if request.content_length is not None and request.content_length > 65536:
                 return web.json_response({"error": "Preferences payload is too large"}, status=413)
             body = bytearray()
             async for chunk in request.content.iter_chunked(4096):
                 body.extend(chunk)
-                if len(body) > 8192:
+                if len(body) > 65536:
                     return web.json_response({"error": "Preferences payload is too large"}, status=413)
             body = json.loads(body)
         except (ValueError, UnicodeError):
@@ -2519,12 +2519,18 @@ if server:
             return web.json_response({"error": "Preferences payload must be a JSON object"}, status=400)
         action = body.get("action")
         try:
-            if action in ("toggle_favorite", "toggle_member"):
+            if action in ("toggle_favorite", "toggle_member", "add_members", "remove_members"):
                 # Reject phantom ids so quota slots cannot be polluted by
                 # styles that never existed in any catalog.
                 known = set(ALL_CHARACTER_STYLE_PROMPTS) | set(ALL_CHARACTER_STYLE_ALIASES) | {"custom"}
                 known |= {style["id"] for style in await asyncio.to_thread(load_user_styles)}
-                if body.get("style_id") not in known:
+                if action in ("add_members", "remove_members"):
+                    ids = body.get("style_ids")
+                    if not isinstance(ids, list) or not ids or len(ids) > 600 or not all(isinstance(i, str) for i in ids):
+                        return web.json_response({"error": "style_ids must be a non-empty list of style IDs"}, status=400)
+                    if not set(ids) <= known:
+                        return web.json_response({"error": "Unknown style ID"}, status=400)
+                elif body.get("style_id") not in known:
                     return web.json_response({"error": "Unknown style ID"}, status=400)
             if action == "toggle_favorite":
                 prefs = await asyncio.to_thread(toggle_style_favorite, body.get("style_id"))
@@ -2536,6 +2542,10 @@ if server:
                 prefs = await asyncio.to_thread(delete_style_set, body.get("name"))
             elif action == "toggle_member":
                 prefs = await asyncio.to_thread(toggle_style_set_member, body.get("name"), body.get("style_id"))
+            elif action == "add_members":
+                prefs = await asyncio.to_thread(add_style_set_members, body.get("name"), body.get("style_ids"))
+            elif action == "remove_members":
+                prefs = await asyncio.to_thread(remove_style_set_members, body.get("name"), body.get("style_ids"))
             else:
                 return web.json_response({"error": "Unknown style preference action"}, status=400)
             return web.json_response(prefs)
