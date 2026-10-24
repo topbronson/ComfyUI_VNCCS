@@ -210,7 +210,7 @@ USER_STYLE_PREFS_PATH = os.path.join(os.path.dirname(USER_CHARACTER_STYLES_PATH)
 _MAX_PREFS_BYTES = 4194304  # must exceed worst case: _MAX_SETS x _MAX_SET_MEMBERS x max id len
 _SET_NAME_LIMIT = 60
 _MAX_SETS = 50
-_MAX_SET_MEMBERS = 1000  # must cover a full catalog fill (union of all style catalogs)
+_MAX_SET_MEMBERS = 1000  # must hold a full single-catalog set (user 'All styles' holds 360)
 _MAX_FAVORITES = 200
 _STYLE_ID_RE = re.compile(r"[a-z0-9_]{1,100}")
 
@@ -366,49 +366,6 @@ def add_style_set_members(name, style_ids):
 
 def remove_style_set_members(name, style_ids):
     return _bulk_style_set_members(name, style_ids, False)
-
-
-def fill_set_from_catalog(name, catalog_paths, extra_ids=()):
-    """(Re)fill a set with every style ID found in the given catalog files.
-
-    Idempotent: replaces the set's members with the deduplicated union of
-    catalog IDs (plus ``extra_ids``, e.g. user-created styles served
-    alongside them), so re-running it also picks up newly added styles.
-    A case-insensitive match on an existing set name fills that set.
-    """
-    name = _clean_set_name(name)
-    ids, seen = [], set()
-    for style_id in extra_ids:
-        if isinstance(style_id, str) and _valid_style_id(style_id) and style_id not in seen:
-            seen.add(style_id)
-            ids.append(style_id)
-    for path in catalog_paths:
-        try:
-            with open(path, "r", encoding="utf-8") as source:
-                catalog = json.load(source)
-        except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError(f"Style catalog unavailable: {exc}") from exc
-        groups = catalog.get("groups") if isinstance(catalog, dict) else None
-        for group in groups or []:
-            if not isinstance(group, dict):
-                continue
-            for item in group.get("styles") or []:
-                style_id = item.get("id") if isinstance(item, dict) else None
-                if isinstance(style_id, str) and _valid_style_id(style_id) and style_id not in seen:
-                    seen.add(style_id)
-                    ids.append(style_id)
-    if not ids:
-        raise ValueError("Style catalogs contain no usable styles")
-    if len(ids) > _MAX_SET_MEMBERS:
-        raise ValueError(f"Catalog holds {len(ids)} styles; a set holds up to {_MAX_SET_MEMBERS}")
-    def mutate(prefs):
-        target = next((k for k in prefs["sets"] if k.casefold() == name.casefold()), None)
-        if target is None:
-            if len(prefs["sets"]) >= _MAX_SETS:
-                raise ValueError(f"Up to {_MAX_SETS} style sets are supported")
-            target = name
-        prefs["sets"][target] = list(ids)
-    return _mutate_style_prefs(mutate)
 
 
 def toggle_style_set_member(name, style_id):

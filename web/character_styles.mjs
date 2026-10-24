@@ -2,7 +2,7 @@ import { mountSakuraDialogMotion } from "./sakura_interactions.mjs";
 
 // Style selection stays in widget_data; the user library lives on the server.
 export function createStylePicker({ host, catalog, getInfo, save, fetchApi, cleanup,
-    getPreviewPayload, getCharacter = () => "", imageURL = value => value, listenPreview, showModal, allowNone = () => false, runCharacterPreview = null, getCatalogMode = null,
+    getPreviewPayload, getCharacter = () => "", imageURL = value => value, listenPreview, showModal, allowNone = () => false, runCharacterPreview = null,
     catalogURL = () => "/vnccs/character_styles", getSecondaryInfo, allowSecondary = () => true }) {
     const make = (tag, className, text) => {
         const element = document.createElement(tag);
@@ -315,18 +315,6 @@ export function createStylePicker({ host, catalog, getInfo, save, fetchApi, clea
     };
     const buildSetsActionItems = () => {
         const items = [{ label: "+ New set\u2026", onClick: () => promptNewSet() }];
-        items.push({ label: "Fill a set with every style\u2026", onClick: () => askText({
-            title: "Fill a set with every style", submitText: "Fill", initial: setFilter || "",
-            onSubmit: async value => {
-                const target = value.trim();
-                if (!target) return;
-                const fresh = await postPrefs({ action: "fill_all", name: target, mode: getCatalogMode ? getCatalogMode() : undefined });
-                refreshLibrary();
-                const key = Object.keys(fresh?.sets || {}).find(k => k.toLowerCase() === target.toLowerCase());
-                setStatus(`Set \u201c${key || target}\u201d filled with ${fresh?.sets?.[key]?.length ?? "all"} styles.`);
-                closePopover();
-            },
-        }) });
         for (const name of Object.keys(prefs.sets)) {
             items.push({ divider: true });
             items.push({ label: `Rename ${name}…`, onClick: () => askText({

@@ -1,4 +1,4 @@
-import { createStylePicker } from "./character_styles.mjs?v=style-mix-11";
+import { createStylePicker } from "./character_styles.mjs?v=style-mix-12";
 import { createSakuraInteractions } from "./sakura_interactions.mjs";
 import { openWizardWorkspace } from "./vnccs_wizard_workspace.mjs?v=ws-8";
 import { app } from "../../scripts/app.js";
@@ -2947,7 +2947,6 @@ app.registerExtension({
                     const picker = createStylePicker({
                         host: container, catalog: styleCatalogForMode(state.gen_settings.generation_mode),
                         catalogURL: () => styleCatalogURL(state.gen_settings.generation_mode),
-                        getCatalogMode: () => styleCatalogMode(state.gen_settings.generation_mode),
                         getInfo: () => state.character_info,
                         getCharacter: () => state.character || "", 
                         getSecondaryInfo: () => state.character_info.secondary_style ||= { style: "none" },
