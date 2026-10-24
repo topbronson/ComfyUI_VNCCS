@@ -47,6 +47,7 @@ from .character_styles import (
     square_style_resolution, save_style_preview, save_user_style_preview,
     load_style_prefs, toggle_style_favorite, create_style_set, rename_style_set,
     delete_style_set,    toggle_style_set_member, add_style_set_members, remove_style_set_members,
+    fill_set_from_catalog,
     STYLE_PREVIEWS_DIR,
 )
 from . import vnccs_control_center as control_center
@@ -2569,6 +2570,16 @@ if server:
                 prefs = await asyncio.to_thread(add_style_set_members, body.get("name"), body.get("style_ids"))
             elif action == "remove_members":
                 prefs = await asyncio.to_thread(remove_style_set_members, body.get("name"), body.get("style_ids"))
+            elif action == "fill_all":
+                fill_mode = str(body.get("mode") or "").lower()
+                if fill_mode == "qi2":
+                    fill_paths = (CHARACTER_STYLE_CATALOG_PATH,)
+                elif fill_mode in ("anima", "illustrious"):
+                    fill_paths = (ANIMA_STYLE_CATALOG_PATH,)
+                else:
+                    return web.json_response({"error": "fill_all requires mode (qi2, anima or illustrious)"}, status=400)
+                user_ids = [style["id"] for style in await asyncio.to_thread(load_user_styles)]
+                prefs = await asyncio.to_thread(fill_set_from_catalog, body.get("name"), fill_paths, user_ids)
             else:
                 return web.json_response({"error": "Unknown style preference action"}, status=400)
             return web.json_response(prefs)
